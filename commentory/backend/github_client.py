@@ -21,6 +21,27 @@ async def get_pull_request(owner: str, repo: str, pull_number: int) -> dict[str,
         return response.json()
 
 
+async def create_pull_request(
+    owner: str,
+    repo: str,
+    title: str,
+    head: str,
+    base: str,
+    body: str,
+) -> dict[str, Any]:
+    url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls"
+    payload = {
+        "title": title,
+        "head": head,
+        "base": base,
+        "body": body,
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, headers=_headers(), json=payload)
+        response.raise_for_status()
+        return response.json()
+
+
 async def create_pr_comment(owner: str, repo: str, pull_number: int, body: str) -> dict[str, Any]:
     url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/issues/{pull_number}/comments"
     async with httpx.AsyncClient() as client:
