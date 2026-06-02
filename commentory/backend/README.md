@@ -20,6 +20,8 @@ cp .env.example .env
 ./script/run_server.sh
 ```
 
+로컬에서는 FastAPI 서버와 smee-client가 함께 실행된다. 실제 배포 환경에서는 `RUN_SMEE_CLIENT=false`로 설정하고 GitHub webhook payload URL을 배포 서버의 `/webhooks/github`로 지정한다.
+
 ### 엔드포인트
 
 - `GET /health`
