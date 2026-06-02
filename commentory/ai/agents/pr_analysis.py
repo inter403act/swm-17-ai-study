@@ -1,8 +1,14 @@
+import json
 import re
 from pathlib import Path
 from typing import Any
 
 from rank_bm25 import BM25Okapi
+
+try:
+    from agents.llm import invoke_solar
+except ModuleNotFoundError:
+    from commentory.ai.agents.llm import invoke_solar
 
 try:
     from state import PRState
@@ -58,6 +64,8 @@ MAX_CHANGED_FILES = 20
 MAX_DIFF_CHARS = 60000
 MAX_REPOSITORY_FILES = 200
 MAX_CONTENT_CHUNKS = 400
+MAX_LLM_EVIDENCE_ITEMS = 8
+MAX_LLM_SNIPPET_CHARS = 1200
 SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|github[_-]?token|token|secret|password|credential|private[_-]?key)"
@@ -71,6 +79,29 @@ IMPORT_PATTERNS = (
     re.compile(r"^[+\- ]?\s*import\s+(?:type\s+)?[A-Za-z0-9_{}*,\s]+\s+from\s+[\"']([^\"']+)[\"']", re.MULTILINE),
     re.compile(r"^[+\- ]?\s*import\s+[\"']([^\"']+)[\"']", re.MULTILINE),
 )
+EVIDENCE_SYSTEM_PROMPT = """당신은 Commentory의 PR 분석 Agent 내부에서 동작하는 evidence 검증 보조 모듈입니다.
+
+역할:
+- 주어진 변경 파일 정보와 검색된 repository snippet 후보만 보고, 각 snippet이 PR 변경 근거로 왜 관련 있는지 판단합니다.
+- 요약, 위험도 평가, 체크리스트, 승인/거절 의견은 생성하지 않습니다.
+- snippet에 없는 사실을 추측하지 않습니다.
+- 근거가 약하면 낮은 relevance와 짧은 이유를 남깁니다.
+
+출력은 JSON 객체 하나만 반환합니다.
+
+JSON 스키마:
+{
+  "items": [
+    {
+      "index": 0,
+      "relevance": "high | medium | low",
+      "evidence_reason": "이 snippet이 변경 근거로 관련 있는 이유",
+      "supported_claims": ["snippet으로 확인 가능한 근거"],
+      "uncertainty": "불확실한 지점"
+    }
+  ]
+}
+"""
 
 
 def pr_analysis_agent(state: PRState) -> dict[str, Any]:
@@ -98,7 +129,11 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
         _limit_repository_file_contents(_get_repository_file_contents(pr_data)),
     )
     direct_callers = _find_direct_callers(analyzed_files, _limit_repository_file_contents(_get_repository_file_contents(pr_data)))
-    related_files = _merge_related_files(path_related_files + import_related_files, content_results + direct_callers)
+    evidence_candidates = _enrich_evidence_candidates_with_llm(
+        analyzed_files,
+        content_results + direct_callers,
+    )
+    related_files = _merge_related_files(path_related_files + import_related_files, evidence_candidates)
     related_tests = [item["file"] for item in related_files if _is_test_file(item["file"])]
     main_changes = _build_main_changes(analyzed_files)
 
@@ -122,6 +157,7 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
             "related_files": related_files,
             "bm25_results": content_results,
             "direct_callers": direct_callers,
+            "llm_evidence_used": any("llm_evidence" in item for item in evidence_candidates),
         },
         "test_coverage_signal": {
             "tests_added_or_modified": any(_is_test_file(file_data.get("filename", "")) for file_data in changed_files),
@@ -132,7 +168,7 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
         "limitation_reason": limitation["reasons"],
         "comment_notice": _build_comment_notice(limitation),
         "risk_signals": risk_signals,
-        "evidence": _build_evidence(analyzed_files, content_results + direct_callers),
+        "evidence": _build_evidence(analyzed_files, evidence_candidates),
     }
 
 
@@ -433,6 +469,108 @@ def _find_direct_callers(
     return callers
 
 
+def _enrich_evidence_candidates_with_llm(
+    analyzed_files: list[dict[str, Any]],
+    evidence_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not evidence_candidates:
+        return evidence_candidates
+
+    payload = _build_evidence_payload(analyzed_files, evidence_candidates)
+    response = invoke_solar(EVIDENCE_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False, indent=2))
+    if response is None:
+        return evidence_candidates
+
+    parsed = _parse_json_object(response)
+    if parsed is None:
+        return evidence_candidates
+
+    llm_items = parsed.get("items")
+    if not isinstance(llm_items, list):
+        return evidence_candidates
+
+    enriched_candidates = [dict(candidate) for candidate in evidence_candidates]
+    for item in llm_items:
+        if not isinstance(item, dict):
+            continue
+
+        index = item.get("index")
+        if not isinstance(index, int) or index < 0 or index >= len(enriched_candidates):
+            continue
+
+        llm_evidence = _normalize_llm_evidence(item)
+        if not llm_evidence:
+            continue
+
+        enriched_candidates[index]["llm_evidence"] = llm_evidence
+        enriched_candidates[index]["reason"] = llm_evidence["evidence_reason"]
+
+    return enriched_candidates
+
+
+def _build_evidence_payload(
+    analyzed_files: list[dict[str, Any]],
+    evidence_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "changed_files": [
+            {
+                "path": file_data["path"],
+                "change_type": file_data["change_type"],
+                "symbols": file_data["symbols"],
+                "impact_domains": file_data["impact_domains"],
+                "risk_signals": file_data["risk_signals"],
+                "diff_summary": file_data["diff_summary"],
+                "diff_snippet": file_data["diff_snippet"],
+            }
+            for file_data in analyzed_files
+        ],
+        "evidence_candidates": [
+            {
+                "index": index,
+                "file": candidate.get("file"),
+                "retrieval_source": candidate.get("retrieval_source"),
+                "matched_terms": candidate.get("matched_terms", []),
+                "start_line": candidate.get("start_line"),
+                "end_line": candidate.get("end_line"),
+                "snippet": _truncate_text(candidate.get("snippet", ""), MAX_LLM_SNIPPET_CHARS),
+                "rule_reason": candidate.get("reason"),
+            }
+            for index, candidate in enumerate(evidence_candidates[:MAX_LLM_EVIDENCE_ITEMS])
+        ],
+        "instruction": "각 evidence candidate가 changed_files의 변경 근거로 얼마나 관련 있는지와 그 이유만 판단하세요.",
+    }
+
+
+def _normalize_llm_evidence(item: dict[str, Any]) -> dict[str, Any] | None:
+    relevance = item.get("relevance")
+    if relevance not in {"high", "medium", "low"}:
+        relevance = "medium"
+
+    evidence_reason = item.get("evidence_reason")
+    if not isinstance(evidence_reason, str) or not evidence_reason.strip():
+        return None
+
+    supported_claims = item.get("supported_claims")
+    if not isinstance(supported_claims, list):
+        supported_claims = []
+
+    uncertainty = item.get("uncertainty")
+    if not isinstance(uncertainty, str):
+        uncertainty = ""
+
+    return {
+        "relevance": relevance,
+        "evidence_reason": _mask_secrets(evidence_reason.strip()),
+        "supported_claims": [
+            _mask_secrets(str(claim))
+            for claim in supported_claims
+            if str(claim).strip()
+        ][:5],
+        "uncertainty": _mask_secrets(uncertainty.strip()),
+    }
+
+
 def _build_content_chunks(repository_file_contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     documents = []
 
@@ -652,12 +790,15 @@ def _build_evidence(
         })
 
     for result in content_results[:5]:
-        evidence.append({
+        evidence_item = {
             "file": result["file"],
             "symbol": ", ".join(result["matched_terms"][:3]),
             "summary": result["reason"],
             "snippet": result["snippet"],
-        })
+        }
+        if "llm_evidence" in result:
+            evidence_item["llm_evidence"] = result["llm_evidence"]
+        evidence.append(evidence_item)
     return evidence
 
 
@@ -699,6 +840,33 @@ def _mask_secrets(text: str) -> str:
 
         masked_text = pattern.sub(replacement, masked_text)
     return masked_text
+
+
+def _parse_json_object(content: str) -> dict[str, Any] | None:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match is None:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    masked_text = _mask_secrets(str(text))
+    if len(masked_text) <= max_chars:
+        return masked_text
+    return f"{masked_text[:max_chars]}...[truncated]"
 
 
 def _dedupe(items: list[str] | Any) -> list[str]:
