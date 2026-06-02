@@ -28,7 +28,7 @@ public class TaskService {
                 .orElseThrow();
 
         if (!task.ownerId().equals(ownerId)) {
-            throw new IllegalArgumentException("Cannot complete another user's task");
+            throw new IllegalArgumentException("You can't complete another user's task");
         }
 
         return task.complete();
