@@ -29,7 +29,7 @@ The webhook endpoint only handles `pull_request` events with `action: opened`. S
 
 ### Webhook test quick start
 
-`gh` CLI 로그인, Node.js/npm, `.env`의 `GITHUB_TOKEN` 권한이 필요하다.
+`gh` CLI 로그인과 Node.js/npm이 필요하다. 테스트 스크립트는 `gh auth token`으로 `GITHUB_TOKEN`을 자동 설정한다.
 
 ```bash
 cd commentory/backend

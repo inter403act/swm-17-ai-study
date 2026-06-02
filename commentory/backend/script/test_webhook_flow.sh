@@ -12,6 +12,7 @@ Example:
 
 Environment overrides:
   WEBHOOK_FROM_REPO_URL  Target GitHub repository URL.
+  GITHUB_TOKEN           Optional. Defaults to `gh auth token`.
   SMEE_URL               Default: https://smee.io/commentory-swm17-temp-ai-tech-backend
   SERVER_PORT            Default: 8000
 
