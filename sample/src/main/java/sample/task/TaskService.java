@@ -4,7 +4,7 @@ import java.util.Comparator;
 import java.util.List;
 
 public class TaskService {
-    private static final int DEFAULT_LIMIT = 20;
+    private static final int DEFAULT_LIMIT = 50;
     private final List<Task> tasks;
 
     public TaskService(List<Task> tasks) {
