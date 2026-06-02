@@ -11,11 +11,12 @@ public class TaskService {
         this.tasks = tasks;
     }
 
-    public List<Task> findTasks(Long ownerId, int limit) {
+    public List<Task> findTasks(Long ownerId, TaskStatus status, int limit) {
         int safeLimit = limit <= 0 ? DEFAULT_LIMIT : limit;
 
         return tasks.stream()
                 .filter(task -> task.ownerId().equals(ownerId))
+                .filter(task -> status == null || task.status() == status)
                 .sorted(Comparator.comparing(Task::createdAt).reversed())
                 .limit(safeLimit)
                 .toList();

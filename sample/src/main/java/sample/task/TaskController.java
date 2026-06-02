@@ -17,9 +17,10 @@ public class TaskController {
     @GetMapping
     public List<Task> findTasks(
             @RequestParam Long ownerId,
+            @RequestParam TaskStatus status,
             @RequestParam(defaultValue = "20") int limit
     ) {
-        return taskService.findTasks(ownerId, limit);
+        return taskService.findTasks(ownerId, status, limit);
     }
 
     @PatchMapping("/{taskId}/complete")
