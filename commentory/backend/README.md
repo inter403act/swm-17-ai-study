@@ -17,7 +17,7 @@ cp .env.example .env
 ### 실행
 
 ```bash
-uvicorn main:app --reload
+./script/run_server.sh
 ```
 
 ### 엔드포인트

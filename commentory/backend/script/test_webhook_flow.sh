@@ -37,6 +37,7 @@ SERVER_PID=""
 SMEE_PID=""
 SERVER_LOG=""
 SMEE_LOG=""
+TEST_PR_WORKDIR=""
 
 cleanup() {
   if [[ -n "$SMEE_PID" ]] && kill -0 "$SMEE_PID" >/dev/null 2>&1; then
@@ -47,6 +48,7 @@ cleanup() {
   fi
   [[ -n "$SERVER_LOG" ]] && rm -f "$SERVER_LOG"
   [[ -n "$SMEE_LOG" ]] && rm -f "$SMEE_LOG"
+  [[ -n "$TEST_PR_WORKDIR" ]] && rm -rf "$TEST_PR_WORKDIR"
 }
 trap cleanup EXIT
 
@@ -175,6 +177,61 @@ wait_for_comment() {
   exit 1
 }
 
+create_test_pr() {
+  local base_branch
+  local branch_prefix
+  local timestamp
+  local branch_name
+  local pr_title
+  local pr_body
+  local test_file
+  local pr_url
+
+  TEST_PR_WORKDIR="$(mktemp -d)"
+  base_branch="$(gh api "repos/$TARGET_REPO" --jq '.default_branch')"
+  branch_prefix="${PR_BRANCH_PREFIX:-commentory-webhook-test}"
+  timestamp="$(date +%Y%m%d%H%M%S)"
+  branch_name="${branch_prefix}-${timestamp}"
+  pr_title="${PR_TITLE:-Test Commentory webhook}"
+  pr_body="${PR_BODY:-This PR verifies that Commentory receives pull_request.opened and creates the preset PR comment.}"
+  test_file="commentory-webhook-test-${timestamp}.md"
+
+  echo "$TARGET_REPO repository를 임시 디렉터리에 clone합니다..." >&2
+  gh repo clone "$TARGET_REPO" "$TEST_PR_WORKDIR/repo" -- --quiet
+
+  (
+    cd "$TEST_PR_WORKDIR/repo"
+    git checkout "$base_branch" >/dev/null 2>&1
+    git checkout -b "$branch_name" >/dev/null
+
+    cat > "$test_file" <<EOF
+# Commentory webhook 테스트
+
+- Repository: $TARGET_REPO
+- Branch: $branch_name
+- Created at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+이 파일은 Commentory pull request webhook flow 검증을 위해 생성되었다.
+EOF
+
+    git add "$test_file"
+    git commit -m "Test Commentory webhook" >/dev/null
+    git push -u origin "$branch_name" >/dev/null
+  )
+
+  echo "Pull request를 생성합니다..." >&2
+  pr_url="$(
+    gh pr create \
+      --repo "$TARGET_REPO" \
+      --base "$base_branch" \
+      --head "$branch_name" \
+      --title "$pr_title" \
+      --body "$pr_body"
+  )"
+
+  echo "$pr_url"
+}
+
 require_command gh
 require_command curl
 require_command npx
@@ -227,7 +284,7 @@ SMEE_PID="$!"
 sleep 2
 
 echo "테스트 PR을 생성합니다..."
-PR_URL="$("$SCRIPT_DIR/create_test_pr.sh" "$TARGET_REPO" | tail -n 2 | head -n 1)"
+PR_URL="$(create_test_pr)"
 PR_NUMBER="$(extract_pr_number "$PR_URL")"
 
 echo "PR #$PR_NUMBER 에 Commentory 댓글이 생성되기를 기다립니다..."
