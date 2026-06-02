@@ -12,7 +12,7 @@ public class AuthTokenService {
 
         LocalDateTime now = LocalDateTime.now();
 
-        if (token.expiresAt().isBefore(now)) {
+        if (token.expiresAt().isAfter(now)) {
             throw new IllegalArgumentException("Token has expired");
         }
 
