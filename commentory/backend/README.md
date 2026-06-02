@@ -1,8 +1,8 @@
-## Backend
+## 백엔드
 
-FastAPI backend for the Commentory GitHub webhook MVP.
+Commentory GitHub webhook MVP를 위한 FastAPI 백엔드.
 
-### Setup
+### 설정
 
 ```bash
 cd commentory/backend
@@ -12,22 +12,22 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Set `GITHUB_TOKEN` in `.env` to a fine-grained PAT that can read pull requests and write issue comments for the target repository.
+직접 실행하거나 배포할 때는 `.env` 또는 배포 환경변수에 `GITHUB_TOKEN`을 설정한다. 대상 repo의 pull request를 읽고 issue comment를 작성할 수 있는 fine-grained PAT가 필요하다.
 
-### Run
+### 실행
 
 ```bash
 uvicorn main:app --reload
 ```
 
-### Endpoints
+### 엔드포인트
 
 - `GET /health`
 - `POST /webhooks/github`
 
-The webhook endpoint only handles `pull_request` events with `action: opened`. Signature verification, AI analysis, queues, and automated tests are intentionally omitted for this MVP.
+webhook 엔드포인트는 `pull_request` 이벤트 중 `action: opened`만 처리한다. 이 MVP에서는 서명 검증, AI 분석, queue, 자동화 테스트를 의도적으로 생략했다.
 
-### Webhook test quick start
+### Webhook 테스트 Quick start
 
 `gh` CLI 로그인과 Node.js/npm이 필요하다. 테스트 스크립트는 `gh auth token`으로 `GITHUB_TOKEN`을 자동 설정한다.
 

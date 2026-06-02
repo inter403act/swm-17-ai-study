@@ -3,15 +3,15 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage:
+사용법:
   ./script/create_test_pr.sh owner/repo [base-branch]
 
-Environment overrides:
-  PR_BRANCH_PREFIX  Branch prefix. Default: commentory-webhook-test
-  PR_TITLE          Pull request title. Default: Test Commentory webhook
-  PR_BODY           Pull request body.
+환경변수:
+  PR_BRANCH_PREFIX  branch prefix. 기본값: commentory-webhook-test
+  PR_TITLE          pull request 제목. 기본값: Test Commentory webhook
+  PR_BODY           pull request 본문.
 
-Example:
+예시:
   ./script/create_test_pr.sh ai-tech-practice/temp-ai-tech-backend
 EOF
 }
@@ -28,7 +28,7 @@ if [[ -z "$TARGET_REPO" ]]; then
 fi
 
 if ! command -v gh >/dev/null 2>&1; then
-  echo "gh CLI is required." >&2
+  echo "gh CLI가 필요합니다." >&2
   exit 1
 fi
 
@@ -47,7 +47,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Cloning $TARGET_REPO into a temporary directory..."
+echo "$TARGET_REPO repository를 임시 디렉터리에 clone합니다..."
 gh repo clone "$TARGET_REPO" "$WORKDIR/repo" -- --quiet
 cd "$WORKDIR/repo"
 
@@ -56,20 +56,20 @@ git checkout -b "$BRANCH_NAME" >/dev/null
 
 TEST_FILE="commentory-webhook-test-${TIMESTAMP}.md"
 cat > "$TEST_FILE" <<EOF
-# Commentory webhook test
+# Commentory webhook 테스트
 
 - Repository: $TARGET_REPO
 - Branch: $BRANCH_NAME
 - Created at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-This file was generated to verify the Commentory pull request webhook flow.
+이 파일은 Commentory pull request webhook flow 검증을 위해 생성되었다.
 EOF
 
 git add "$TEST_FILE"
 git commit -m "Test Commentory webhook" >/dev/null
 git push -u origin "$BRANCH_NAME" >/dev/null
 
-echo "Creating pull request..."
+echo "Pull request를 생성합니다..."
 PR_URL="$(
   gh pr create \
     --repo "$TARGET_REPO" \
@@ -80,4 +80,4 @@ PR_URL="$(
 )"
 
 echo "$PR_URL"
-echo "Wait for the Commentory MVP comment on the PR."
+echo "PR에 Commentory MVP 댓글이 생성될 때까지 기다리세요."

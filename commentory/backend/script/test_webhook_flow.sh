@@ -3,25 +3,25 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage:
+사용법:
   ./script/test_webhook_flow.sh "$WEBHOOK_FROM_REPO_URL"
 
-Example:
+예시:
   WEBHOOK_FROM_REPO_URL=https://github.com/ai-tech-practice/temp-ai-tech-backend
   ./script/test_webhook_flow.sh "$WEBHOOK_FROM_REPO_URL"
 
-Environment overrides:
-  WEBHOOK_FROM_REPO_URL  Target GitHub repository URL.
-  GITHUB_TOKEN           Optional. Defaults to `gh auth token`.
-  SMEE_URL               Default: https://smee.io/commentory-swm17-temp-ai-tech-backend
-  SERVER_PORT            Default: 8000
+환경변수:
+  WEBHOOK_FROM_REPO_URL  테스트 대상 GitHub repository URL.
+  GITHUB_TOKEN           선택값. 기본값은 `gh auth token`.
+  SMEE_URL               기본값: https://smee.io/commentory-swm17-temp-ai-tech-backend
+  SERVER_PORT            기본값: 8000
 
-This script:
-  1. Ensures a pull_request webhook exists for the smee URL.
-  2. Starts the local FastAPI webhook server.
-  3. Starts smee-client to forward GitHub webhooks to localhost.
-  4. Creates a test PR.
-  5. Waits until the Commentory MVP comment appears on the PR.
+이 스크립트가 하는 일:
+  1. smee URL용 pull_request webhook이 있는지 확인한다.
+  2. 로컬 FastAPI webhook 서버를 실행한다.
+  3. GitHub webhook을 localhost로 전달하도록 smee-client를 실행한다.
+  4. 테스트 PR을 생성한다.
+  5. PR에 Commentory MVP 댓글이 생길 때까지 기다린다.
 EOF
 }
 
@@ -90,7 +90,7 @@ repo_from_url() {
       repo="${url#git@github.com:}"
       ;;
     *)
-      echo "Repository URL must look like https://github.com/owner/repo." >&2
+      echo "Repository URL은 https://github.com/owner/repo 형식이어야 합니다." >&2
       exit 1
       ;;
   esac
@@ -99,7 +99,7 @@ repo_from_url() {
   repo="${repo%/}"
 
   if [[ ! "$repo" =~ ^[^/]+/[^/]+$ ]]; then
-    echo "Repository URL must look like https://github.com/owner/repo." >&2
+    echo "Repository URL은 https://github.com/owner/repo 형식이어야 합니다." >&2
     exit 1
   fi
 
@@ -117,7 +117,7 @@ wait_for_url() {
     sleep 1
   done
 
-  echo "Timed out waiting for $label." >&2
+  echo "$label 대기 시간이 초과되었습니다." >&2
   exit 1
 }
 
@@ -131,11 +131,11 @@ ensure_webhook() {
   )"
 
   if [[ -n "$hook_id" ]]; then
-    echo "Webhook already exists: $hook_id"
+    echo "Webhook이 이미 존재합니다: $hook_id"
     return
   fi
 
-  echo "Creating webhook for $TARGET_REPO..."
+  echo "$TARGET_REPO repository에 webhook을 생성합니다..."
   gh api "repos/$TARGET_REPO/hooks" \
     -X POST \
     -f name=web \
@@ -144,7 +144,7 @@ ensure_webhook() {
     -f "config[url]=$SMEE_URL" \
     -f 'config[content_type]=json' \
     -f 'config[insecure_ssl]=0' \
-    --jq '"Webhook created: \(.id)"'
+    --jq '"Webhook 생성 완료: \(.id)"'
 }
 
 extract_pr_number() {
@@ -171,7 +171,7 @@ wait_for_comment() {
     sleep 2
   done
 
-  echo "Timed out waiting for Commentory comment on PR #$pr_number." >&2
+  echo "PR #$pr_number 에 Commentory 댓글이 생성되기를 기다리다 시간이 초과되었습니다." >&2
   exit 1
 }
 
@@ -206,11 +206,11 @@ SMEE_LOG="$(mktemp)"
 ensure_webhook
 
 if lsof -iTCP:"$SERVER_PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
-  echo "Port $SERVER_PORT is already in use. Stop the existing process or set SERVER_PORT." >&2
+  echo "$SERVER_PORT 포트가 이미 사용 중입니다. 기존 프로세스를 종료하거나 SERVER_PORT를 변경하세요." >&2
   exit 1
 fi
 
-echo "Starting FastAPI server on 127.0.0.1:$SERVER_PORT..."
+echo "FastAPI 서버를 127.0.0.1:$SERVER_PORT 에서 실행합니다..."
 (
   cd "$BACKEND_DIR"
   uvicorn main:app --host 127.0.0.1 --port "$SERVER_PORT"
@@ -218,7 +218,7 @@ echo "Starting FastAPI server on 127.0.0.1:$SERVER_PORT..."
 SERVER_PID="$!"
 wait_for_url "http://127.0.0.1:$SERVER_PORT/health" "FastAPI server"
 
-echo "Starting smee-client..."
+echo "smee-client를 실행합니다..."
 npx -y smee-client \
   --url "$SMEE_URL" \
   --target "http://127.0.0.1:$SERVER_PORT/webhooks/github" \
@@ -226,14 +226,14 @@ npx -y smee-client \
 SMEE_PID="$!"
 sleep 2
 
-echo "Creating test PR..."
+echo "테스트 PR을 생성합니다..."
 PR_URL="$("$SCRIPT_DIR/create_test_pr.sh" "$TARGET_REPO" | tail -n 2 | head -n 1)"
 PR_NUMBER="$(extract_pr_number "$PR_URL")"
 
-echo "Waiting for Commentory comment on PR #$PR_NUMBER..."
+echo "PR #$PR_NUMBER 에 Commentory 댓글이 생성되기를 기다립니다..."
 COMMENT_URL="$(wait_for_comment "$PR_NUMBER")"
 
 echo
-echo "Webhook flow test succeeded."
+echo "Webhook flow 테스트가 성공했습니다."
 echo "PR: $PR_URL"
 echo "Comment: $COMMENT_URL"
