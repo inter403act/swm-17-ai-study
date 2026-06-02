@@ -25,12 +25,13 @@ public class TaskService {
         Task task = tasks.stream()
                 .filter(item -> item.id().equals(taskId))
                 .findFirst()
-                .orElseThrow();
+                .orElseThrow(() -> new IllegalArgumentException("Task not found"));
 
-        if (!task.ownerId().equals(ownerId)) {
-            throw new IllegalArgumentException("Cannot complete another user's task");
-        }
+        Task completedTask = task.complete();
 
-        return task.complete();
+        tasks.remove(task);
+        tasks.add(completedTask);
+
+        return completedTask;
     }
 }
