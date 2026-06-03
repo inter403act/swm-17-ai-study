@@ -46,9 +46,17 @@ cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
   fi
-  [[ -n "$SERVER_LOG" ]] && rm -f "$SERVER_LOG"
-  [[ -n "$SMEE_LOG" ]] && rm -f "$SMEE_LOG"
-  [[ -n "$TEST_PR_WORKDIR" ]] && rm -rf "$TEST_PR_WORKDIR"
+  if [[ -n "$SERVER_LOG" ]]; then
+    rm -f "$SERVER_LOG" || true
+  fi
+  if [[ -n "$SMEE_LOG" ]]; then
+    rm -f "$SMEE_LOG" || true
+  fi
+  if [[ -n "$TEST_PR_WORKDIR" ]]; then
+    rm -rf "$TEST_PR_WORKDIR" || true
+  fi
+
+  return 0
 }
 trap cleanup EXIT
 
