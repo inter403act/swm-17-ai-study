@@ -21,6 +21,14 @@ async def get_pull_request(owner: str, repo: str, pull_number: int) -> dict[str,
         return response.json()
 
 
+async def get_pull_request_files(owner: str, repo: str, pull_number: int) -> list[dict[str, Any]]:
+    url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pull_number}/files"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=_headers())
+        response.raise_for_status()
+        return response.json()
+
+
 async def create_pull_request(
     owner: str,
     repo: str,
