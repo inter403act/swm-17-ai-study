@@ -3,13 +3,18 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 
-from github_client import create_pr_comment, get_pull_request
+from github_client import (
+    create_pr_comment,
+    get_file_content,
+    get_pull_request,
+    get_pull_request_files,
+    get_repository_tree,
+)
 
-# Enable this import with the workflow block below.
-# from github_client import get_pull_request_files
-
-# Enable this after merging origin/feature/agentic-workflow.
-# from commentory.ai.graph import run_workflow
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../ai")))
+from graph import run_workflow
 
 
 app = FastAPI(title="Commentory Backend")
@@ -42,14 +47,30 @@ async def github_webhook(
 
     try:
         pull_request = await get_pull_request(owner, repo, pull_number)
+        changed_files = await get_pull_request_files(owner, repo, pull_number)
+
+        base_branch = pull_request.get("base", {}).get("ref", "main")
+        repo_tree = await get_repository_tree(owner, repo, branch=base_branch)
+
+        changed_paths = {f["filename"] for f in changed_files}
+        changed_dirs = {f["filename"].rsplit("/", 1)[0] for f in changed_files if "/" in f["filename"]}
+        candidate_paths = [
+            p for p in repo_tree
+            if any(p.startswith(d + "/") for d in changed_dirs) and p not in changed_paths
+        ][:20]
+
+        repository_file_contents = []
+        for path in candidate_paths:
+            content = await get_file_content(owner, repo, path, ref=base_branch)
+            if content:
+                repository_file_contents.append({"path": path, "content": content})
 
         # Enable this block after the AI workflow branch is merged.
-        # changed_files = await get_pull_request_files(owner, repo, pull_number)
-        # initial_state = build_workflow_initial_state(pull_request, changed_files)
-        # workflow_result = run_workflow(initial_state)
-        # comment = build_comment_from_workflow_result(repo_info["full_name"], pull_number, workflow_result)
+        initial_state = build_workflow_initial_state(pull_request, changed_files, repo_tree, repository_file_contents)
+        workflow_result = run_workflow(initial_state)
+        comment = build_comment_from_workflow_result(repo_info["full_name"], pull_number, workflow_result)
 
-        comment = build_comment(repo_info["full_name"], pull_number, pull_request.get("title", ""))
+        #comment = build_comment(repo_info["full_name"], pull_number, pull_request.get("title", ""))
         created_comment = await create_pr_comment(owner, repo, pull_number, comment)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
@@ -88,6 +109,8 @@ def build_comment(repository: str, pull_number: int, title: str) -> str:
 def build_workflow_initial_state(
     pull_request: dict[str, Any],
     changed_files: list[dict[str, Any]] | None = None,
+    repo_tree: list[str] | None = None,
+    repository_file_contents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the state contract expected by commentory.ai.graph.run_workflow()."""
     return {
@@ -95,9 +118,8 @@ def build_workflow_initial_state(
             "title": pull_request.get("title", ""),
             "body": pull_request.get("body", ""),
             "changed_files": changed_files or [],
-            # Add these later if the workflow needs repository-wide context.
-            "repo_tree": [],
-            "repository_file_contents": [],
+            "repo_tree": repo_tree or [],
+            "repository_file_contents": repository_file_contents or [],
         },
         "impact_context": None,
         "summary_result": None,
