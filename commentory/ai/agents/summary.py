@@ -2,7 +2,10 @@ import json
 import re
 from typing import Any, Dict, Mapping, Optional
 
-from agents.llm import invoke_solar
+try:
+    from agents.llm import invoke_solar
+except ModuleNotFoundError:
+    from commentory.ai.agents.llm import invoke_solar
 
 try:
     from state import PRState
