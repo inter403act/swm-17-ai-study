@@ -89,6 +89,11 @@ MAX_REPOSITORY_FILES = 200
 MAX_CONTENT_CHUNKS = 400
 MAX_LLM_EVIDENCE_ITEMS = 8
 MAX_LLM_SNIPPET_CHARS = 1200
+MAX_LLM_BODY_CHARS = 4000
+MAX_WATCH_POINTS = 8
+MIN_CITATION_QUOTE_CHARS = 8
+# watch-point는 코드 변경에만 생성한다(문서/설정/테스트-only PR은 LLM 호출 생략).
+WATCH_POINT_CHANGE_TYPES = {"logic_change", "api_change"}
 SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|github[_-]?token|token|secret|password|credential|private[_-]?key)"
@@ -102,25 +107,33 @@ IMPORT_PATTERNS = (
     re.compile(r"^[+\- ]?\s*import\s+(?:type\s+)?[A-Za-z0-9_{}*,\s]+\s+from\s+[\"']([^\"']+)[\"']", re.MULTILINE),
     re.compile(r"^[+\- ]?\s*import\s+[\"']([^\"']+)[\"']", re.MULTILINE),
 )
-EVIDENCE_SYSTEM_PROMPT = """당신은 Commentory의 PR 분석 Agent 내부에서 동작하는 evidence 검증 보조 모듈입니다.
+WATCH_POINT_SYSTEM_PROMPT = """당신은 Commentory의 PR 분석 Agent 내부에서 동작하는 관찰(watch-point) 생성 모듈입니다.
 
 역할:
-- 주어진 변경 파일 정보와 검색된 repository snippet 후보만 보고, 각 snippet이 PR 변경 근거로 왜 관련 있는지 판단합니다.
-- 요약, 위험도 평가, 체크리스트, 승인/거절 의견은 생성하지 않습니다.
-- snippet에 없는 사실을 추측하지 않습니다.
-- 근거가 약하면 낮은 relevance와 짧은 이유를 남깁니다.
+- 변경 코드 본문, 정적 분석으로 확정된 구조 관찰(anchors), 검색된 관련 snippet만 보고
+  리뷰어가 반드시 봐둬야 할 지점(watch-point)을 근거와 함께 생성합니다.
+- 위험도 등급(HIGH/MEDIUM/LOW) 판정, 점수, 승인/거절 의견은 내지 않습니다. 그것은 다른 단계의 일입니다.
+- anchors(죽은 인자 / 공유 가변 상태 / 삭제된 인가 가드 등)는 이미 코드로 확정된 사실입니다.
+  이를 출발점으로 "그래서 무엇이 문제가 될 수 있고, 리뷰어가 무엇을 확인해야 하는지"를 연결하세요.
+  예: 가드 삭제 + 죽은 인자 → 원래 검증이 있었다는 흔적이며 인가 우회 가능성으로 연결.
+- 제공된 코드/스니펫에 없는 사실은 절대 지어내지 마세요.
+- 모든 watch-point에는 반드시 근거 인용(citations)을 붙이세요. 인용에는 file과, 가능하면
+  제공된 텍스트에서 그대로 복사한 실제 코드 한 줄(quote)을 넣으세요.
+  근거를 인용할 수 없으면 그 watch-point는 만들지 마세요.
 
-출력은 JSON 객체 하나만 반환합니다.
+출력은 JSON 객체 하나만 반환합니다. 다른 말은 하지 마세요.
 
 JSON 스키마:
 {
-  "items": [
+  "watch_points": [
     {
-      "index": 0,
-      "relevance": "high | medium | low",
-      "evidence_reason": "이 snippet이 변경 근거로 관련 있는 이유",
-      "supported_claims": ["snippet으로 확인 가능한 근거"],
-      "uncertainty": "불확실한 지점"
+      "observation": "리뷰어가 봐둬야 할 핵심을 한 문장으로",
+      "reasoning": "변경/anchor로부터 이것이 왜 주의 지점인지의 추론",
+      "watch_for": "리뷰어가 구체적으로 확인/검증해야 할 것",
+      "citations": [
+        {"file": "파일 경로 또는 파일명", "lines": "30-32", "quote": "제공된 코드에서 그대로 복사한 한 줄"}
+      ],
+      "anchored_on": ["사용한 anchor 키, 예: dead_parameter:ownerId (없으면 빈 배열)"]
     }
   ]
 }
@@ -153,10 +166,13 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
     )
     content_results = _search_related_contents(search_terms, retrieval_contents)
     direct_callers = _find_direct_callers(analyzed_files, retrieval_contents)
-    evidence_candidates = _enrich_evidence_candidates_with_llm(
-        analyzed_files,
-        content_results + direct_callers,
-    )
+    evidence_candidates = content_results + direct_callers
+    changed_contents = {
+        file_data["filename"]: file_data["content"]
+        for file_data in scoped_changed_files
+        if file_data.get("filename") and file_data.get("content")
+    }
+    watch_points = _generate_watch_points(analyzed_files, evidence_candidates, changed_contents)
     related_files = _merge_related_files(path_related_files + import_related_files, evidence_candidates)
     related_tests = [item["file"] for item in related_files if _is_test_file(item["file"])]
     main_changes = _build_main_changes(analyzed_files)
@@ -182,7 +198,7 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
             "related_files": related_files,
             "bm25_results": content_results,
             "direct_callers": direct_callers,
-            "llm_evidence_used": any("llm_evidence" in item for item in evidence_candidates),
+            "watch_points_generated": len(watch_points),
         },
         "test_coverage_signal": {
             "tests_added_or_modified": any(_is_test_file(file_data.get("filename", "")) for file_data in changed_files),
@@ -195,6 +211,7 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
         "risk_signals": risk_signals,
         "security_concerns": security_concerns,
         "structural_observations": _build_structural_observations(analyzed_files),
+        "watch_points": watch_points,
         "evidence": _build_evidence(analyzed_files, evidence_candidates),
     }
 
@@ -597,106 +614,187 @@ def _find_direct_callers(
     return callers
 
 
-def _enrich_evidence_candidates_with_llm(
+def _generate_watch_points(
     analyzed_files: list[dict[str, Any]],
     evidence_candidates: list[dict[str, Any]],
+    changed_contents: dict[str, str],
 ) -> list[dict[str, Any]]:
-    if not evidence_candidates:
-        return evidence_candidates
+    """변경 본문 + 구조 관찰(anchors) + 검색 근거로 '근거 인용된 watch-point'를 생성한다.
 
-    payload = _build_evidence_payload(analyzed_files, evidence_candidates)
-    response = invoke_solar(EVIDENCE_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False, indent=2))
+    LLM이 만든 watch-point는 제공된 코드에 실제로 근거가 있는 것만 통과시킨다(환각 폐기).
+    위험도 판정은 하지 않으며, 다운스트림(risk/checklist)이 소비할 관찰만 만든다.
+    """
+    # 코드 변경 파일에만 watch-point를 생성한다. 문서/설정/테스트만 바뀐 경우 LLM 호출을
+    # 생략(비용 절감)하고, 문서 본문의 시나리오 설명을 코드 리뷰로 오인하는 것도 막는다.
+    code_files = [
+        file_data for file_data in analyzed_files
+        if file_data["change_type"] in WATCH_POINT_CHANGE_TYPES
+    ]
+    if not code_files:
+        return []
+
+    payload = _build_watch_point_payload(code_files, evidence_candidates, changed_contents)
+    response = invoke_solar(WATCH_POINT_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False, indent=2))
     if response is None:
-        return evidence_candidates
+        return []
 
     parsed = _parse_json_object(response)
     if parsed is None:
-        return evidence_candidates
+        return []
 
-    llm_items = parsed.get("items")
-    if not isinstance(llm_items, list):
-        return evidence_candidates
+    raw_watch_points = parsed.get("watch_points")
+    if not isinstance(raw_watch_points, list):
+        return []
 
-    enriched_candidates = [dict(candidate) for candidate in evidence_candidates]
-    for item in llm_items:
-        if not isinstance(item, dict):
-            continue
-
-        index = item.get("index")
-        if not isinstance(index, int) or index < 0 or index >= len(enriched_candidates):
-            continue
-
-        llm_evidence = _normalize_llm_evidence(item)
-        if not llm_evidence:
-            continue
-
-        enriched_candidates[index]["llm_evidence"] = llm_evidence
-        enriched_candidates[index]["reason"] = llm_evidence["evidence_reason"]
-
-    return enriched_candidates
+    corpus = _build_citation_corpus(code_files, evidence_candidates, changed_contents)
+    known_files = _known_file_basenames(code_files, evidence_candidates)
+    return _validate_watch_points(raw_watch_points, corpus, known_files)
 
 
-def _build_evidence_payload(
+def _build_watch_point_payload(
     analyzed_files: list[dict[str, Any]],
     evidence_candidates: list[dict[str, Any]],
+    changed_contents: dict[str, str],
 ) -> dict[str, Any]:
+    changed_files = []
+    for file_data in analyzed_files:
+        body = changed_contents.get(file_data["path"])
+        changed_files.append({
+            "path": file_data["path"],
+            "change_type": file_data["change_type"],
+            "diff_snippet": file_data["diff_snippet"],
+            "changed_file_body": _truncate_text(body, MAX_LLM_BODY_CHARS) if body else None,
+            "anchors": {
+                "dead_parameters": file_data.get("dead_parameters", []),
+                "shared_mutable_fields": file_data.get("shared_mutable_fields", []),
+                "removed_access_control": [
+                    _mask_secrets(line) for line in file_data.get("removed_access_control", [])
+                ],
+            },
+        })
+
+    evidence = [
+        {
+            "file": candidate.get("file"),
+            "start_line": candidate.get("start_line"),
+            "end_line": candidate.get("end_line"),
+            "snippet": _truncate_text(candidate.get("snippet", ""), MAX_LLM_SNIPPET_CHARS),
+            "rule_reason": candidate.get("reason"),
+        }
+        for candidate in evidence_candidates[:MAX_LLM_EVIDENCE_ITEMS]
+    ]
+
     return {
-        "changed_files": [
-            {
-                "path": file_data["path"],
-                "change_type": file_data["change_type"],
-                "symbols": file_data["symbols"],
-                "impact_domains": file_data["impact_domains"],
-                "risk_signals": file_data["risk_signals"],
-                "diff_summary": file_data["diff_summary"],
-                "diff_snippet": file_data["diff_snippet"],
-            }
-            for file_data in analyzed_files
-        ],
-        "evidence_candidates": [
-            {
-                "index": index,
-                "file": candidate.get("file"),
-                "retrieval_source": candidate.get("retrieval_source"),
-                "matched_terms": candidate.get("matched_terms", []),
-                "start_line": candidate.get("start_line"),
-                "end_line": candidate.get("end_line"),
-                "snippet": _truncate_text(candidate.get("snippet", ""), MAX_LLM_SNIPPET_CHARS),
-                "rule_reason": candidate.get("reason"),
-            }
-            for index, candidate in enumerate(evidence_candidates[:MAX_LLM_EVIDENCE_ITEMS])
-        ],
-        "instruction": "각 evidence candidate가 changed_files의 변경 근거로 얼마나 관련 있는지와 그 이유만 판단하세요.",
+        "changed_files": changed_files,
+        "evidence_candidates": evidence,
+        "instruction": (
+            "anchors는 정적 분석으로 확정된 사실이다. 이를 출발점으로, 변경 본문과 evidence에서 "
+            "근거를 인용해 리뷰어가 봐둬야 할 watch-point를 생성하라. 인용 못 붙이는 것은 만들지 마라."
+        ),
     }
 
 
-def _normalize_llm_evidence(item: dict[str, Any]) -> dict[str, Any] | None:
-    relevance = item.get("relevance")
-    if relevance not in {"high", "medium", "low"}:
-        relevance = "medium"
+def _build_citation_corpus(
+    analyzed_files: list[dict[str, Any]],
+    evidence_candidates: list[dict[str, Any]],
+    changed_contents: dict[str, str],
+) -> str:
+    """인용 검증용 코퍼스: LLM에 제공된 모든 코드 텍스트를 정규화해 합친다."""
+    parts = []
+    for file_data in analyzed_files:
+        parts.append(file_data.get("diff_snippet", ""))
+        body = changed_contents.get(file_data["path"])
+        if body:
+            parts.append(body[:MAX_LLM_BODY_CHARS])
+    for candidate in evidence_candidates[:MAX_LLM_EVIDENCE_ITEMS]:
+        parts.append(candidate.get("snippet", ""))
+    return _normalize_ws("\n".join(parts))
 
-    evidence_reason = item.get("evidence_reason")
-    if not isinstance(evidence_reason, str) or not evidence_reason.strip():
-        return None
 
-    supported_claims = item.get("supported_claims")
-    if not isinstance(supported_claims, list):
-        supported_claims = []
+def _known_file_basenames(
+    analyzed_files: list[dict[str, Any]],
+    evidence_candidates: list[dict[str, Any]],
+) -> set[str]:
+    names = {Path(file_data["path"]).name.lower() for file_data in analyzed_files}
+    names.update(
+        Path(str(candidate.get("file") or "")).name.lower()
+        for candidate in evidence_candidates
+        if candidate.get("file")
+    )
+    return names
 
-    uncertainty = item.get("uncertainty")
-    if not isinstance(uncertainty, str):
-        uncertainty = ""
 
-    return {
-        "relevance": relevance,
-        "evidence_reason": _mask_secrets(evidence_reason.strip()),
-        "supported_claims": [
-            _mask_secrets(str(claim))
-            for claim in supported_claims
-            if str(claim).strip()
-        ][:5],
-        "uncertainty": _mask_secrets(uncertainty.strip()),
-    }
+def _validate_watch_points(
+    raw_watch_points: list[Any],
+    corpus: str,
+    known_files: set[str],
+) -> list[dict[str, Any]]:
+    validated = []
+    for item in raw_watch_points:
+        if not isinstance(item, dict):
+            continue
+        observation = item.get("observation")
+        if not isinstance(observation, str) or not observation.strip():
+            continue
+
+        valid_citations = _grounded_citations(item.get("citations"), corpus, known_files)
+        if not valid_citations:
+            # 근거를 코드에서 확인할 수 없는 watch-point는 폐기(환각 차단).
+            continue
+
+        anchored_on = item.get("anchored_on")
+        if not isinstance(anchored_on, list):
+            anchored_on = []
+
+        validated.append({
+            "observation": _mask_secrets(observation.strip()),
+            "reasoning": _mask_secrets(str(item.get("reasoning") or "").strip()),
+            "watch_for": _mask_secrets(str(item.get("watch_for") or "").strip()),
+            "citations": valid_citations,
+            "anchored_on": [str(anchor) for anchor in anchored_on][:6],
+        })
+        if len(validated) >= MAX_WATCH_POINTS:
+            break
+    return validated
+
+
+def _grounded_citations(
+    citations: Any,
+    corpus: str,
+    known_files: set[str],
+) -> list[dict[str, str]]:
+    """제공된 코드에 실제로 근거가 있는 인용만 남긴다.
+
+    - quote가 코퍼스(제공된 코드)의 부분 문자열이면 grounded.
+    - quote가 없거나 짧으면, 최소한 실재하는 파일을 가리킬 때만 약하게 인정.
+    """
+    if not isinstance(citations, list):
+        return []
+
+    grounded = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        file = str(citation.get("file") or "").strip()
+        quote = str(citation.get("quote") or "").strip()
+        lines = str(citation.get("lines") or "").strip()
+
+        normalized_quote = _normalize_ws(quote)
+        has_quote = len(normalized_quote) >= MIN_CITATION_QUOTE_CHARS
+        if has_quote:
+            # quote를 제공했다면 반드시 제공된 코드에 실재해야 한다.
+            # 코퍼스에 없으면 조작된 인용이므로 거부(파일명만으로 fallback하지 않음).
+            if normalized_quote in corpus:
+                grounded.append({"file": file, "lines": lines, "quote": _mask_secrets(quote)})
+        elif file and Path(file).name.lower() in known_files:
+            # quote 없이 실재 파일을 가리키는 약한 근거는 허용.
+            grounded.append({"file": file, "lines": lines, "quote": ""})
+
+    return grounded[:4]
+
+
+def _normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip().lower()
 
 
 def _build_content_chunks(repository_file_contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -940,15 +1038,12 @@ def _build_evidence(
         })
 
     for result in content_results[:5]:
-        evidence_item = {
+        evidence.append({
             "file": result["file"],
             "symbol": ", ".join(result["matched_terms"][:3]),
             "summary": result["reason"],
             "snippet": result["snippet"],
-        }
-        if "llm_evidence" in result:
-            evidence_item["llm_evidence"] = result["llm_evidence"]
-        evidence.append(evidence_item)
+        })
     return evidence
 
 
