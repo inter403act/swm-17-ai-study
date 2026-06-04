@@ -51,6 +51,17 @@ RISK_SIGNAL_KEYWORDS = {
     "public_api": ("@getmapping", "@postmapping", "@putmapping", "@deletemapping", "router", "endpoint"),
     "runtime_behavior": ("service", "controller", "handler", "middleware", "usecase"),
 }
+# 인가/소유권 검증(가드)이 diff에서 "삭제"되었는지 탐지하기 위한 어휘.
+# 추가(+)가 아니라 삭제(-)된 줄에서만 검사하므로, 단순히 검증 메시지 문구만 바꾼
+# 변경(가드는 그대로 유지)과 검증 자체를 제거한 변경을 구분할 수 있다.
+ACCESS_CONTROL_TERMS = (
+    "owner", "ownerid", "permission", "role", "authorize", "authorization",
+    "acl", "forbidden", "unauthorized", "privilege", "admin", "grant",
+)
+GUARD_TOKENS = (
+    "if", "throw", "require", "assert", "check", "validate",
+    "equals", "==", "!=", "deny", "reject", "guard",
+)
 SYMBOL_PATTERNS = (
     re.compile(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)"),
     re.compile(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
@@ -136,6 +147,7 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
     related_files = _merge_related_files(path_related_files + import_related_files, evidence_candidates)
     related_tests = [item["file"] for item in related_files if _is_test_file(item["file"])]
     main_changes = _build_main_changes(analyzed_files)
+    security_concerns = _build_security_concerns(analyzed_files)
 
     return {
         "change_intent": _infer_change_intent(pr_data, analyzed_files),
@@ -168,8 +180,21 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
         "limitation_reason": limitation["reasons"],
         "comment_notice": _build_comment_notice(limitation),
         "risk_signals": risk_signals,
+        "security_concerns": security_concerns,
         "evidence": _build_evidence(analyzed_files, evidence_candidates),
     }
+
+
+def _build_security_concerns(analyzed_files: list[dict[str, Any]]) -> list[str]:
+    """삭제된 인가/소유권 가드를 위험 평가 단계가 바로 인지하도록 명시적 항목으로 정리한다."""
+    concerns = []
+    for file_data in analyzed_files:
+        for line in file_data.get("removed_access_control", []):
+            concerns.append(
+                f"{file_data['path']}에서 인가/소유권 검증으로 보이는 코드가 삭제되었습니다: "
+                f"{_mask_secrets(line)}"
+            )
+    return concerns
 
 
 def _build_change_stats(changed_files: list[dict[str, Any]]) -> dict[str, int]:
@@ -228,17 +253,42 @@ def _analyze_changed_file(file_data: dict[str, Any]) -> dict[str, Any]:
     path = file_data.get("filename", "")
     patch = file_data.get("patch") or ""
     symbols = _extract_symbols(path, patch)
+    domains = _extract_domains(path, patch)
+    risk_signals = _extract_risk_signals(path, patch)
+    removed_access_control = _detect_removed_access_control(patch)
+
+    # 인가 가드가 삭제됐다면 도메인/위험 신호를 보강해 위험 평가 단계가
+    # 보안 영향을 인지할 수 있도록 한다.
+    if removed_access_control:
+        domains = _dedupe([*domains, "authorization"])
+        risk_signals = _dedupe([*risk_signals, "security", "access_control"])
 
     return {
         "path": path,
         "status": file_data.get("status"),
         "change_type": _classify_change_type(path, patch),
         "symbols": symbols,
-        "impact_domains": _extract_domains(path, patch),
-        "risk_signals": _extract_risk_signals(path, patch),
+        "impact_domains": domains,
+        "risk_signals": risk_signals,
+        "removed_access_control": removed_access_control,
         "diff_summary": _build_diff_summary(path, file_data, symbols),
         "diff_snippet": _mask_secrets(_extract_diff_snippet(patch)),
     }
+
+
+def _detect_removed_access_control(patch: str) -> list[str]:
+    """diff에서 삭제된('-') 줄 중 인가/소유권 가드로 보이는 라인을 수집한다."""
+    removed = []
+    for line in patch.splitlines():
+        if not line.startswith("-") or line.startswith("---"):
+            continue
+        body = line[1:].strip()
+        lowered = body.lower()
+        has_access_term = any(term in lowered for term in ACCESS_CONTROL_TERMS)
+        has_guard_token = any(token in lowered for token in GUARD_TOKENS)
+        if has_access_term and has_guard_token:
+            removed.append(body)
+    return removed
 
 
 def _classify_change_type(path: str, patch: str) -> str:
