@@ -11,9 +11,9 @@ except ModuleNotFoundError:
     from commentory.ai.agents.llm import invoke_solar
 
 try:
-    from agents.code_structure import analyze_changed_file_structure
+    from agents.code_structure import analyze_changed_file_structure, find_call_sites
 except ModuleNotFoundError:
-    from commentory.ai.agents.code_structure import analyze_changed_file_structure
+    from commentory.ai.agents.code_structure import analyze_changed_file_structure, find_call_sites
 
 try:
     from state import PRState
@@ -301,7 +301,6 @@ def _limit_repository_file_contents(repository_file_contents: list[dict[str, Any
 def _analyze_changed_file(file_data: dict[str, Any]) -> dict[str, Any]:
     path = file_data.get("filename", "")
     patch = file_data.get("patch") or ""
-    symbols = _extract_symbols(path, patch)
     domains = _extract_domains(path, patch)
     risk_signals = _extract_risk_signals(path, patch)
     removed_access_control = _detect_removed_access_control(patch)
@@ -312,9 +311,10 @@ def _analyze_changed_file(file_data: dict[str, Any]) -> dict[str, Any]:
         domains = _dedupe([*domains, "authorization"])
         risk_signals = _dedupe([*risk_signals, "security", "access_control"])
 
-    # tree-sitter AST 기반 데이터플로우 관찰. content(head 전체 본문)가 있으면 고신뢰로,
-    # 없으면 patch 재구성으로 동작한다(미지원 언어/문법 부재 시 빈 결과).
+    # tree-sitter AST 기반 데이터플로우 관찰 + 정의 심볼 추출(한 번 파싱).
+    # content(head 전체 본문)가 있으면 고신뢰로, 없으면 patch 재구성으로 동작한다.
     structure = analyze_changed_file_structure(path, patch, file_data.get("content"))
+    symbols = _resolve_symbols(path, patch, structure)
     dead_parameters = structure["dead_parameters"]
     shared_mutable_fields = structure["shared_mutable_fields"]
     if dead_parameters:
@@ -368,7 +368,19 @@ def _classify_change_type(path: str, patch: str) -> str:
     return "logic_change"
 
 
+def _resolve_symbols(path: str, patch: str, structure: dict[str, Any]) -> list[str]:
+    """AST(tree-sitter)가 추출한 정의 심볼을 우선 쓰고, 불가하면 정규식으로 폴백한다."""
+    if structure.get("available"):
+        symbols = set(structure.get("symbols") or [])
+        stem = Path(path).stem
+        if stem:
+            symbols.add(stem)
+        return sorted(symbols)
+    return _extract_symbols(path, patch)
+
+
 def _extract_symbols(path: str, patch: str) -> list[str]:
+    """정규식 폴백: tree-sitter 미지원 언어/문법 부재 시에만 사용된다."""
     symbols = set()
     stem = Path(path).stem
     if stem:
@@ -553,7 +565,7 @@ def _search_related_contents(
 
 
 def _looks_like_call(line: str, symbol: str) -> bool:
-    """심볼이 호출부로 쓰였는지(정의/생성자는 제외) 판단한다."""
+    """심볼이 호출부로 쓰였는지(정의/생성자는 제외) 판단한다. 정규식 폴백 전용."""
     escaped = re.escape(symbol)
     if re.search(rf"\bnew\s+{escaped}\s*\(", line):  # 생성자: new Symbol(...)
         return False
@@ -562,18 +574,37 @@ def _looks_like_call(line: str, symbol: str) -> bool:
     return True
 
 
+def _regex_call_sites(lines: list[str], symbols: set[str]) -> list[dict[str, Any]]:
+    """정규식 폴백: AST 미지원 언어 파일에서 호출부 후보 라인을 찾는다."""
+    sites = []
+    for index, line in enumerate(lines):
+        matched_symbols = [
+            symbol
+            for symbol in symbols
+            if re.search(rf"\b{re.escape(symbol)}\s*\(", line) and _looks_like_call(line, symbol)
+        ]
+        if matched_symbols:
+            sites.append({"line": index + 1, "matched_symbols": sorted(matched_symbols)})
+    return sites
+
+
 def _find_direct_callers(
     analyzed_files: list[dict[str, Any]],
     repository_file_contents: list[dict[str, Any]],
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    symbols = _dedupe(
+    """변경 심볼을 실제로 호출하는 위치를 찾는다.
+
+    Java는 tree-sitter(AST)로 method_invocation만 매칭해 선언 오인을 막고,
+    AST 미지원 파일은 정규식으로 폴백한다(다중 언어 레포 회귀 방지).
+    """
+    symbols = {
         symbol
         for file_data in analyzed_files
         for symbol in file_data["symbols"]
         if len(symbol) > 2
-    )
-    callers = []
+    }
+    callers: list[dict[str, Any]] = []
 
     if not symbols:
         return callers
@@ -585,16 +616,17 @@ def _find_direct_callers(
             continue
 
         lines = content.splitlines()
-        for index, line in enumerate(lines):
-            matched_symbols = [
-                symbol
-                for symbol in symbols
-                if re.search(rf"\b{re.escape(symbol)}\s*\(", line)
-                and _looks_like_call(line, symbol)
-            ]
-            if not matched_symbols:
-                continue
+        ast_sites = find_call_sites(path, content, symbols)
+        if ast_sites is None:
+            sites = _regex_call_sites(lines, symbols)
+            source = "symbol_regex_match"
+        else:
+            sites = ast_sites
+            source = "symbol_ast_match"
 
+        for site in sites:
+            index = site["line"] - 1
+            matched_symbols = site["matched_symbols"]
             start = max(index - 5, 0)
             end = min(index + 6, len(lines))
             callers.append({
@@ -604,8 +636,8 @@ def _find_direct_callers(
                 "start_line": start + 1,
                 "end_line": end,
                 "snippet": _mask_secrets("\n".join(lines[start:end])),
-                "reason": f"변경 symbol 호출부 후보로 감지됨: {', '.join(matched_symbols[:3])}",
-                "retrieval_source": "symbol_exact_match",
+                "reason": f"변경 symbol 호출부로 감지됨: {', '.join(matched_symbols[:3])}",
+                "retrieval_source": source,
             })
 
             if len(callers) >= limit:

@@ -32,6 +32,11 @@ SINGLETON_ANNOTATIONS = {
     "Service", "Component", "Repository", "Controller", "RestController",
     "Configuration", "Bean",
 }
+# 파일이 정의하는 심볼(다른 파일이 참조할 수 있는 식별자)로 볼 노드 타입.
+DEFINITION_NODE_TYPES = (
+    "class_declaration", "interface_declaration", "enum_declaration",
+    "record_declaration", "annotation_type_declaration", "method_declaration",
+)
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 _PARSER = None
@@ -55,15 +60,18 @@ def _get_parser():
     return _PARSER
 
 
+def _empty_result() -> dict[str, Any]:
+    return {"dead_parameters": [], "shared_mutable_fields": [], "symbols": [], "available": False}
+
+
 def analyze_changed_file_structure(path: str, patch: str, content: str | None) -> dict[str, Any]:
-    """변경 파일 하나에서 구조적 관찰(죽은 인자/공유 가변 상태)을 추출한다."""
-    empty = {"dead_parameters": [], "shared_mutable_fields": [], "available": False}
+    """변경 파일 하나에서 구조적 관찰(죽은 인자/공유 가변 상태)과 정의 심볼을 추출한다."""
     if not path.lower().endswith(SUPPORTED_SUFFIXES):
-        return empty
+        return _empty_result()
 
     parser = _get_parser()
     if parser is None:
-        return empty
+        return _empty_result()
 
     added_lines, removed_identifiers = _parse_patch(patch or "")
 
@@ -76,14 +84,15 @@ def analyze_changed_file_structure(path: str, patch: str, content: str | None) -
         source = _reconstruct_after_text(patch or "")
         confident = False
         if not source.strip():
-            return empty
+            return _empty_result()
 
     try:
         source_bytes = source.encode("utf-8")
         tree = parser.parse(source_bytes)
     except Exception:
-        return empty
+        return _empty_result()
 
+    symbols = _extract_defined_symbols(tree.root_node, source_bytes)
     dead_parameters: list[dict[str, Any]] = []
     shared_mutable_fields: list[dict[str, Any]] = []
 
@@ -148,8 +157,58 @@ def analyze_changed_file_structure(path: str, patch: str, content: str | None) -
     return {
         "dead_parameters": dead_parameters,
         "shared_mutable_fields": shared_mutable_fields,
+        "symbols": symbols,
         "available": True,
     }
+
+
+def _extract_defined_symbols(root, source_bytes: bytes) -> list[str]:
+    """파일이 정의하는 타입/메서드 이름을 AST에서 추출한다(정규식 휴리스틱 대체)."""
+    names: set[str] = set()
+    for node_type in DEFINITION_NODE_TYPES:
+        for node in _iter_nodes(root, node_type):
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                names.add(_txt(name_node, source_bytes))
+    return sorted(name for name in names if name)
+
+
+def find_call_sites(path: str, content: str, target_symbols: set[str]) -> list[dict[str, Any]] | None:
+    """content에서 target_symbols 메서드를 '실제로 호출'하는 위치를 AST로 찾는다.
+
+    method_invocation 노드만 보므로 메서드 '선언'을 호출로 오인하지 않는다(정규식의 결함 해소).
+    지원하지 않는 언어/문법 부재/파싱 실패 시 None을 반환하여 호출부가 정규식으로 폴백하게 한다.
+    반환: [{"line": 1-based, "matched_symbols": [..]}] (line 오름차순)
+    """
+    if not path.lower().endswith(SUPPORTED_SUFFIXES):
+        return None
+
+    parser = _get_parser()
+    if parser is None:
+        return None
+    if not content:
+        return []
+
+    try:
+        source_bytes = content.encode("utf-8")
+        tree = parser.parse(source_bytes)
+    except Exception:
+        return None
+
+    by_line: dict[int, set[str]] = {}
+    for invocation in _iter_nodes(tree.root_node, "method_invocation"):
+        name_node = invocation.child_by_field_name("name")
+        if name_node is None:
+            continue
+        name = _txt(name_node, source_bytes)
+        if name in target_symbols:
+            line = name_node.start_point[0] + 1
+            by_line.setdefault(line, set()).add(name)
+
+    return [
+        {"line": line, "matched_symbols": sorted(matched)}
+        for line, matched in sorted(by_line.items())
+    ]
 
 
 # --------------------------------------------------------------------------- #
