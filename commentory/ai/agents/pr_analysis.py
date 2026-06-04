@@ -6,14 +6,19 @@ from typing import Any
 from rank_bm25 import BM25Okapi
 
 try:
-    from agents.llm import invoke_solar
+    from agents.llm import get_solar_api_key, invoke_solar
 except ModuleNotFoundError:
-    from commentory.ai.agents.llm import invoke_solar
+    from commentory.ai.agents.llm import get_solar_api_key, invoke_solar
 
 try:
     from agents.code_structure import analyze_changed_file_structure, find_call_sites
 except ModuleNotFoundError:
     from commentory.ai.agents.code_structure import analyze_changed_file_structure, find_call_sites
+
+try:
+    from agents.code_provider import InMemoryCodeProvider
+except ModuleNotFoundError:
+    from commentory.ai.agents.code_provider import InMemoryCodeProvider
 
 try:
     from state import PRState
@@ -172,7 +177,9 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
         for file_data in scoped_changed_files
         if file_data.get("filename") and file_data.get("content")
     }
-    watch_points = _generate_watch_points(analyzed_files, evidence_candidates, changed_contents)
+    watch_points, watch_point_mode = _build_watch_points(
+        analyzed_files, evidence_candidates, changed_contents, retrieval_contents
+    )
     related_files = _merge_related_files(path_related_files + import_related_files, evidence_candidates)
     related_tests = [item["file"] for item in related_files if _is_test_file(item["file"])]
     main_changes = _build_main_changes(analyzed_files)
@@ -199,6 +206,7 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
             "bm25_results": content_results,
             "direct_callers": direct_callers,
             "watch_points_generated": len(watch_points),
+            "watch_point_mode": watch_point_mode,
         },
         "test_coverage_signal": {
             "tests_added_or_modified": any(_is_test_file(file_data.get("filename", "")) for file_data in changed_files),
@@ -646,6 +654,47 @@ def _find_direct_callers(
     return callers
 
 
+def _build_watch_points(
+    analyzed_files: list[dict[str, Any]],
+    evidence_candidates: list[dict[str, Any]],
+    changed_contents: dict[str, str],
+    retrieval_contents: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    """watch-point를 생성한다. agentic(tool 루프) 우선, 실패 시 one-shot으로 폴백.
+
+    반환: (watch_points, mode) — mode ∈ {"agentic", "oneshot", "skipped"}.
+    """
+    code_files = [
+        file_data for file_data in analyzed_files
+        if file_data["change_type"] in WATCH_POINT_CHANGE_TYPES
+    ]
+    if not code_files:
+        return [], "skipped"
+    if not _solar_llm_available():
+        return _generate_watch_points(analyzed_files, evidence_candidates, changed_contents), "oneshot"
+
+    # provider 코퍼스 = 사전 fetch된 sibling + 변경 파일 본문(둘 다 도구로 조회 가능).
+    provider = InMemoryCodeProvider(retrieval_contents, changed_contents)
+
+    # 지연 import로 순환 의존(pr_analysis ↔ watch_point_agent)을 끊는다.
+    try:
+        from agents.watch_point_agent import run_watch_point_agent
+    except ModuleNotFoundError:
+        from commentory.ai.agents.watch_point_agent import run_watch_point_agent
+
+    agentic_watch_points = run_watch_point_agent(code_files, provider)
+    if agentic_watch_points is not None:
+        return agentic_watch_points, "agentic"
+
+    # 키 없음 / tool-calling 실패 / JSON 파싱 실패 → one-shot 폴백(항상 동작 보장).
+    return _generate_watch_points(analyzed_files, evidence_candidates, changed_contents), "oneshot"
+
+
+def _solar_llm_available() -> bool:
+    api_key = get_solar_api_key()
+    return bool(api_key and api_key != "{SOLAR_API_KEY}")
+
+
 def _generate_watch_points(
     analyzed_files: list[dict[str, Any]],
     evidence_candidates: list[dict[str, Any]],
@@ -666,7 +715,10 @@ def _generate_watch_points(
         return []
 
     payload = _build_watch_point_payload(code_files, evidence_candidates, changed_contents)
-    response = invoke_solar(WATCH_POINT_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False, indent=2))
+    try:
+        response = invoke_solar(WATCH_POINT_SYSTEM_PROMPT, json.dumps(payload, ensure_ascii=False, indent=2))
+    except Exception:
+        return []
     if response is None:
         return []
 

@@ -211,6 +211,80 @@ def find_call_sites(path: str, content: str, target_symbols: set[str]) -> list[d
     ]
 
 
+# DEFINITION_NODE_TYPES 중 "타입" 선언(메서드 제외). 정의 탐색 시 메서드를 우선한다.
+_TYPE_DECLARATION_TYPES = tuple(t for t in DEFINITION_NODE_TYPES if t != "method_declaration")
+
+
+def _parse_java(content: str):
+    """Java content를 파싱해 (root_node, source_bytes)를 반환. 불가 시 None."""
+    if not content:
+        return None
+    parser = _get_parser()
+    if parser is None:
+        return None
+    try:
+        source_bytes = content.encode("utf-8")
+        tree = parser.parse(source_bytes)
+    except Exception:
+        return None
+    return tree.root_node, source_bytes
+
+
+def _node_info(node, kind: str, source_bytes: bytes) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "name": _field_text(node, "name", source_bytes),
+        "start_line": node.start_point[0] + 1,
+        "end_line": node.end_point[0] + 1,
+        "text": _txt(node, source_bytes),
+    }
+
+
+def get_symbol_definition(content: str, symbol: str) -> dict[str, Any] | None:
+    """content에서 이름이 symbol인 메서드/타입 정의를 찾아 본문과 위치를 반환한다.
+
+    메서드를 우선 매칭하고, 없으면 타입(class/interface/enum/record) 선언을 매칭한다.
+    반환: {"kind", "name", "start_line", "end_line", "text"} 또는 None.
+    """
+    parsed = _parse_java(content)
+    if parsed is None:
+        return None
+    root, source_bytes = parsed
+
+    for node in _iter_nodes(root, "method_declaration"):
+        if _field_text(node, "name", source_bytes) == symbol:
+            return _node_info(node, "method", source_bytes)
+
+    for node_type in _TYPE_DECLARATION_TYPES:
+        for node in _iter_nodes(root, node_type):
+            if _field_text(node, "name", source_bytes) == symbol:
+                return _node_info(node, node_type.replace("_declaration", ""), source_bytes)
+
+    return None
+
+
+def get_enclosing_context(content: str, line: int) -> dict[str, Any] | None:
+    """1-based line을 감싸는 가장 좁은 메서드/타입 선언을 반환한다(없으면 None)."""
+    parsed = _parse_java(content)
+    if parsed is None:
+        return None
+    root, source_bytes = parsed
+
+    best = None
+    best_span = None
+    for node_type in ("method_declaration", *_TYPE_DECLARATION_TYPES):
+        for node in _iter_nodes(root, node_type):
+            start = node.start_point[0] + 1
+            end = node.end_point[0] + 1
+            if start <= line <= end:
+                span = end - start
+                if best_span is None or span < best_span:
+                    kind = "method" if node_type == "method_declaration" else node_type.replace("_declaration", "")
+                    best = _node_info(node, kind, source_bytes)
+                    best_span = span
+    return best
+
+
 # --------------------------------------------------------------------------- #
 # patch 파싱
 # --------------------------------------------------------------------------- #
