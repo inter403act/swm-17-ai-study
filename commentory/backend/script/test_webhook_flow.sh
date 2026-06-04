@@ -32,7 +32,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMMENT_MARKER="## Commentory MVP"
+COMMENT_MARKER="## Commentory"
 SERVER_PID=""
 SMEE_PID=""
 SERVER_LOG=""
@@ -73,7 +73,7 @@ load_env() {
   local key
   local value
 
-  [[ -f "$env_file" ]] || return
+  [[ -f "$env_file" ]] || return 0
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
