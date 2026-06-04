@@ -62,6 +62,13 @@ GUARD_TOKENS = (
     "if", "throw", "require", "assert", "check", "validate",
     "equals", "==", "!=", "deny", "reject", "guard",
 )
+# 심볼 추출 시 걸러낼 언어 키워드 / 표준 타입성 토큰 (탐욕적 정규식 노이즈 방지).
+SYMBOL_STOP_TOKENS = {"if", "for", "while", "switch", "catch", "return", "new", "else"}
+# 검색어에서 제외할 영어 불용어 + 체인지타입 접두사 (일반명사 노이즈 방지).
+ENGLISH_STOP_WORDS = {
+    "and", "add", "the", "for", "with", "from", "into", "support", "update",
+    "improve", "change", "fix", "feat", "chore", "refactor", "docs", "simplify",
+}
 SYMBOL_PATTERNS = (
     re.compile(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)"),
     re.compile(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
@@ -135,11 +142,12 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
     search_terms = _build_search_terms(analyzed_files, pr_data, imports)
     path_related_files = _find_related_files(analyzed_files, pr_data.get("repo_tree") or [], search_terms)
     import_related_files = _find_import_related_files(imports, pr_data.get("repo_tree") or [])
-    content_results = _search_related_contents(
-        search_terms,
+    retrieval_contents = _exclude_changed_files(
         _limit_repository_file_contents(_get_repository_file_contents(pr_data)),
+        analyzed_files,
     )
-    direct_callers = _find_direct_callers(analyzed_files, _limit_repository_file_contents(_get_repository_file_contents(pr_data)))
+    content_results = _search_related_contents(search_terms, retrieval_contents)
+    direct_callers = _find_direct_callers(analyzed_files, retrieval_contents)
     evidence_candidates = _enrich_evidence_candidates_with_llm(
         analyzed_files,
         content_results + direct_callers,
@@ -315,7 +323,16 @@ def _extract_symbols(path: str, patch: str) -> list[str]:
     for pattern in SYMBOL_PATTERNS:
         symbols.update(match.group(1) for match in pattern.finditer(patch))
 
-    return sorted(symbols)
+    return sorted(symbol for symbol in symbols if not _is_noise_symbol(symbol))
+
+
+def _is_noise_symbol(symbol: str) -> bool:
+    """언어 키워드나 표준 예외/타입성 토큰을 심볼에서 제외한다."""
+    if symbol.lower() in SYMBOL_STOP_TOKENS:
+        return True
+    if re.search(r"(?:Exception|Error)$", symbol):
+        return True
+    return False
 
 
 def _extract_domains(path: str, patch: str) -> list[str]:
@@ -426,6 +443,19 @@ def _get_repository_file_contents(pr_data: dict[str, Any]) -> list[dict[str, Any
     return pr_data.get("repository_file_contents") or pr_data.get("related_file_contents") or []
 
 
+def _exclude_changed_files(
+    repository_file_contents: list[dict[str, Any]],
+    analyzed_files: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """변경 파일 자신은 retrieval 코퍼스에서 제외한다(자기-매칭 노이즈 방지)."""
+    changed_paths = {file_data["path"] for file_data in analyzed_files}
+    return [
+        file_data
+        for file_data in repository_file_contents
+        if (file_data.get("path") or file_data.get("filename")) not in changed_paths
+    ]
+
+
 def _search_related_contents(
     search_terms: list[str],
     repository_file_contents: list[dict[str, Any]],
@@ -468,6 +498,16 @@ def _search_related_contents(
     return results
 
 
+def _looks_like_call(line: str, symbol: str) -> bool:
+    """심볼이 호출부로 쓰였는지(정의/생성자는 제외) 판단한다."""
+    escaped = re.escape(symbol)
+    if re.search(rf"\bnew\s+{escaped}\s*\(", line):  # 생성자: new Symbol(...)
+        return False
+    if re.search(rf"\b(?:def|function|class)\s+{escaped}\b", line):  # 정의부
+        return False
+    return True
+
+
 def _find_direct_callers(
     analyzed_files: list[dict[str, Any]],
     repository_file_contents: list[dict[str, Any]],
@@ -496,6 +536,7 @@ def _find_direct_callers(
                 symbol
                 for symbol in symbols
                 if re.search(rf"\b{re.escape(symbol)}\s*\(", line)
+                and _looks_like_call(line, symbol)
             ]
             if not matched_symbols:
                 continue
@@ -712,16 +753,18 @@ def _build_search_terms(
     pr_data: dict[str, Any],
     imports: list[dict[str, str]],
 ) -> list[str]:
-    terms = []
+    # 고신호(심볼/도메인)를 일반 토큰(경로/메타데이터)보다 앞에 배치해 우선순위를 준다.
+    high_signal = []
+    low_signal = []
     for file_data in analyzed_files:
+        high_signal.extend(symbol.lower() for symbol in file_data["symbols"])
+        high_signal.extend(domain.lower() for domain in file_data["impact_domains"])
         path = Path(file_data["path"])
-        terms.extend(
+        low_signal.extend(
             part.lower()
             for part in path.parts
-            if len(part) > 2 and part.lower() not in PATH_STOP_TERMS
+            if len(part) > 2 and not _is_stop_term(part.lower())
         )
-        terms.extend(symbol.lower() for symbol in file_data["symbols"])
-        terms.extend(domain.lower() for domain in file_data["impact_domains"])
 
     metadata_text = " ".join(
         str(value)
@@ -732,8 +775,15 @@ def _build_search_terms(
             " ".join(import_data["import"] for import_data in imports),
         ]
     )
-    terms.extend(token for token in _tokenize(metadata_text) if len(token) > 2 and token not in PATH_STOP_TERMS)
-    return _dedupe(terms)
+    low_signal.extend(
+        token for token in _tokenize(metadata_text)
+        if len(token) > 2 and not _is_stop_term(token)
+    )
+    return _dedupe([*high_signal, *low_signal])
+
+
+def _is_stop_term(term: str) -> bool:
+    return term in PATH_STOP_TERMS or term in ENGLISH_STOP_WORDS
 
 
 def _build_summary(pr_data: dict[str, Any], analyzed_files: list[dict[str, Any]], domains: list[str]) -> str:
