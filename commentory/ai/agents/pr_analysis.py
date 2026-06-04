@@ -11,6 +11,11 @@ except ModuleNotFoundError:
     from commentory.ai.agents.llm import invoke_solar
 
 try:
+    from agents.code_structure import analyze_changed_file_structure
+except ModuleNotFoundError:
+    from commentory.ai.agents.code_structure import analyze_changed_file_structure
+
+try:
     from state import PRState
 except ModuleNotFoundError:
     from commentory.ai.state import PRState
@@ -189,7 +194,26 @@ def build_impact_context(pr_data: dict[str, Any]) -> dict[str, Any]:
         "comment_notice": _build_comment_notice(limitation),
         "risk_signals": risk_signals,
         "security_concerns": security_concerns,
+        "structural_observations": _build_structural_observations(analyzed_files),
         "evidence": _build_evidence(analyzed_files, evidence_candidates),
+    }
+
+
+def _build_structural_observations(analyzed_files: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """AST(tree-sitter)로 추출한 데이터플로우 관찰을 위험 평가가 바로 볼 수 있게 모은다.
+
+    판단(위험도)이 아니라 '근거 있는 사실'만 담는다: 죽은 인자, 공유 가변 상태.
+    """
+    dead_parameters = []
+    shared_mutable_fields = []
+    for file_data in analyzed_files:
+        for item in file_data.get("dead_parameters", []):
+            dead_parameters.append({"file": file_data["path"], **item})
+        for item in file_data.get("shared_mutable_fields", []):
+            shared_mutable_fields.append({"file": file_data["path"], **item})
+    return {
+        "dead_parameters": dead_parameters,
+        "shared_mutable_fields": shared_mutable_fields,
     }
 
 
@@ -271,6 +295,17 @@ def _analyze_changed_file(file_data: dict[str, Any]) -> dict[str, Any]:
         domains = _dedupe([*domains, "authorization"])
         risk_signals = _dedupe([*risk_signals, "security", "access_control"])
 
+    # tree-sitter AST 기반 데이터플로우 관찰. content(head 전체 본문)가 있으면 고신뢰로,
+    # 없으면 patch 재구성으로 동작한다(미지원 언어/문법 부재 시 빈 결과).
+    structure = analyze_changed_file_structure(path, patch, file_data.get("content"))
+    dead_parameters = structure["dead_parameters"]
+    shared_mutable_fields = structure["shared_mutable_fields"]
+    if dead_parameters:
+        risk_signals = _dedupe([*risk_signals, "dead_parameter"])
+    if shared_mutable_fields:
+        risk_signals = _dedupe([*risk_signals, "shared_mutable_state"])
+        domains = _dedupe([*domains, "concurrency"])
+
     return {
         "path": path,
         "status": file_data.get("status"),
@@ -279,7 +314,9 @@ def _analyze_changed_file(file_data: dict[str, Any]) -> dict[str, Any]:
         "impact_domains": domains,
         "risk_signals": risk_signals,
         "removed_access_control": removed_access_control,
-        "diff_summary": _build_diff_summary(path, file_data, symbols),
+        "dead_parameters": dead_parameters,
+        "shared_mutable_fields": shared_mutable_fields,
+        "diff_summary": _build_diff_summary(path, file_data, symbols, dead_parameters, shared_mutable_fields),
         "diff_snippet": _mask_secrets(_extract_diff_snippet(patch)),
     }
 
@@ -857,11 +894,24 @@ def _build_comment_notice(limitation: dict[str, Any]) -> str | None:
     return "대규모 PR로 인해 주요 파일과 snippet 중심으로 분석되었습니다."
 
 
-def _build_diff_summary(path: str, file_data: dict[str, Any], symbols: list[str]) -> str:
+def _build_diff_summary(
+    path: str,
+    file_data: dict[str, Any],
+    symbols: list[str],
+    dead_parameters: list[dict[str, Any]] | None = None,
+    shared_mutable_fields: list[dict[str, Any]] | None = None,
+) -> str:
     additions = int(file_data.get("additions") or 0)
     deletions = int(file_data.get("deletions") or 0)
     symbol_text = f" 주요 symbol 후보: {', '.join(symbols[:5])}." if symbols else ""
-    return _mask_secrets(f"{path}에서 {additions}줄 추가, {deletions}줄 삭제가 발생했습니다.{symbol_text}")
+    # AST 관찰을 요약에 접합 → main_changes/evidence 경유로 다운스트림(checklist)까지 전달된다.
+    observation_text = "".join(
+        f" [구조 관찰] {item['evidence']}"
+        for item in [*(dead_parameters or []), *(shared_mutable_fields or [])]
+    )
+    return _mask_secrets(
+        f"{path}에서 {additions}줄 추가, {deletions}줄 삭제가 발생했습니다.{symbol_text}{observation_text}"
+    )
 
 
 def _extract_diff_snippet(patch: str, max_lines: int = 8) -> str:

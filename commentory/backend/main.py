@@ -52,6 +52,17 @@ async def github_webhook(
         base_branch = pull_request.get("base", {}).get("ref", "main")
         repo_tree = await get_repository_tree(owner, repo, branch=base_branch)
 
+        # diff(patch)만으로는 변경 메서드 전체를 볼 수 없어 dataflow(죽은 인자 등) 분석이
+        # 불가능하므로, 변경 파일의 head ref 전체 본문을 함께 실어준다. (삭제 파일은 본문 없음)
+        head_ref = pull_request.get("head", {}).get("sha") or pull_request.get("head", {}).get("ref")
+        if head_ref:
+            for changed_file in changed_files:
+                if changed_file.get("status") == "removed":
+                    continue
+                head_content = await get_file_content(owner, repo, changed_file["filename"], ref=head_ref)
+                if head_content is not None:
+                    changed_file["content"] = head_content
+
         changed_paths = {f["filename"] for f in changed_files}
         changed_dirs = {f["filename"].rsplit("/", 1)[0] for f in changed_files if "/" in f["filename"]}
         candidate_paths = [
