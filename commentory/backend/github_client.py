@@ -3,7 +3,7 @@ from typing import Any
 
 import httpx
 
-from config import GITHUB_API_URL, require_github_token
+from commentory.backend.config import GITHUB_API_URL, require_github_token
 
 
 def _headers() -> dict[str, str]:

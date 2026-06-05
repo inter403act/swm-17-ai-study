@@ -25,6 +25,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$BACKEND_DIR/.." && pwd)"
 SERVER_PID=""
 
 load_env() {
@@ -71,10 +72,10 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
   fi
 fi
 
-cd "$BACKEND_DIR"
+cd "$REPO_ROOT"
 
 if [[ "$RUN_SMEE_CLIENT" == "false" ]]; then
-  exec uvicorn main:app --host "$SERVER_HOST" --port "$SERVER_PORT"
+  exec uvicorn commentory.backend.main:app --host "$SERVER_HOST" --port "$SERVER_PORT"
 fi
 
 if ! command -v npx >/dev/null 2>&1; then
@@ -83,7 +84,7 @@ if ! command -v npx >/dev/null 2>&1; then
 fi
 
 echo "FastAPI 서버를 $SERVER_HOST:$SERVER_PORT 에서 실행합니다..."
-uvicorn main:app --host "$SERVER_HOST" --port "$SERVER_PORT" &
+uvicorn commentory.backend.main:app --host "$SERVER_HOST" --port "$SERVER_PORT" &
 SERVER_PID="$!"
 
 echo "smee-client를 실행합니다: $SMEE_URL -> http://127.0.0.1:$SERVER_PORT/webhooks/github"

@@ -32,6 +32,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$BACKEND_DIR/.." && pwd)"
 COMMENT_MARKER="## Commentory"
 SERVER_PID=""
 SMEE_PID=""
@@ -277,8 +278,8 @@ fi
 
 echo "FastAPI 서버를 127.0.0.1:$SERVER_PORT 에서 실행합니다..."
 (
-  cd "$BACKEND_DIR"
-  uvicorn main:app --host 127.0.0.1 --port "$SERVER_PORT"
+  cd "$REPO_ROOT"
+  uvicorn commentory.backend.main:app --host 127.0.0.1 --port "$SERVER_PORT"
 ) > "$SERVER_LOG" 2>&1 &
 SERVER_PID="$!"
 wait_for_url "http://127.0.0.1:$SERVER_PORT/health" "FastAPI server"
