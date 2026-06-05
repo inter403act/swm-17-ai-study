@@ -1,1 +1,3 @@
+-r ../ai/requirements.txt
 streamlit
+httpx
