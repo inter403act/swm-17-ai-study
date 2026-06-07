@@ -203,60 +203,14 @@ def normalize_step(event: dict[str, Any]) -> str:
 
 
 def workflow_node_states(events: list[dict[str, Any]]) -> dict[str, str]:
-    states = {step: "waiting" for step in GRAPH_NODES}
     if not events:
-        return states
+        return {step: "waiting" for step in GRAPH_NODES}
 
-    for index, event in enumerate(events):
-        step = normalize_step(event)
-        event_type = event.get("event_type")
-        status = event.get("status")
-
-        if status == "PENDING":
-            states["pending"] = "running"
-            continue
-
-        if event_type == "node_started":
-            states["pending"] = "done"
-            if step in states:
-                states[step] = "running"
-            continue
-
-        if event_type == "node_finished":
-            if step in states:
-                states[step] = "done"
-            if step == "checklist":
-                states["skip_checklist"] = "skipped"
-            if step == "skip_checklist":
-                states["checklist"] = "skipped"
-            continue
-
-        if status == "FAILED":
-            states["pending"] = "done"
-            if step in states:
-                states[step] = "failed"
-            else:
-                states["completed"] = "failed"
-            continue
-
-        if status == "COMPLETED":
-            states["pending"] = "done"
-            for completed_step in ("pr_analysis", "summary", "risk", "join"):
-                if states[completed_step] == "running":
-                    states[completed_step] = "done"
-            if states["checklist"] == "running":
-                states["checklist"] = "done"
-                states["skip_checklist"] = "skipped"
-            if states["skip_checklist"] == "running":
-                states["skip_checklist"] = "done"
-                states["checklist"] = "skipped"
-            states["completed"] = "done"
-            continue
-
-        if event_type is None and step in states:
-            states[step] = "running" if index == len(events) - 1 else "done"
-
-    return states
+    latest_nodes = events[-1].get("nodes") or {}
+    return {
+        step: latest_nodes.get(step, "waiting")
+        for step in GRAPH_NODES
+    }
 
 
 def workflow_progress(events: list[dict[str, Any]]) -> float:
@@ -500,6 +454,10 @@ def run_workflow(runner: WorkflowRunner, comment_builder: CommentBuilder) -> Non
             "status": "FAILED",
             "current_step": "failed",
             "message": str(exc),
+            "nodes": {
+                **workflow_node_states(st.session_state.events),
+                "completed": "failed",
+            },
         }
         st.session_state.events.append(failed_event)
         st.error(str(exc))

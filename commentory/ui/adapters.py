@@ -494,28 +494,14 @@ def create_risk_test_pull_request(repository_ref: RepositoryRef, risk_level: Ris
 
 def run_agent_workflow_for_ui(initial_state: dict[str, Any]) -> Iterator[dict[str, Any]]:
     contracts = load_contracts()
-    workflow_result = None
 
     for event in contracts.stream_workflow_status(initial_state):
-        workflow_result = event.get("result") or workflow_result
+        result = event.get("result")
         yield {
-            "type": "status",
+            "type": "result" if result is not None else "status",
             "event": event,
-            "result": None,
+            "result": result,
         }
-
-    if workflow_result is None:
-        workflow_result = contracts.run_workflow(initial_state)
-
-    yield {
-        "type": "result",
-        "event": {
-            "status": "COMPLETED",
-            "current_step": "completed",
-            "message": "Agent workflow 결과를 불러왔습니다.",
-        },
-        "result": workflow_result,
-    }
 
 
 def build_comment_body(repository: str, pull_number: int, workflow_result: dict[str, Any]) -> str:
