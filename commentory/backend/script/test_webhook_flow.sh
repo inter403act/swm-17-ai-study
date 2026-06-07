@@ -69,7 +69,7 @@ require_command() {
 }
 
 load_env() {
-  local env_file="$BACKEND_DIR/.env"
+  local env_file="$REPO_ROOT/.env"
   local line
   local key
   local value

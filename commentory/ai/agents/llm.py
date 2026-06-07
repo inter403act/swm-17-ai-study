@@ -1,5 +1,9 @@
 import os
+from pathlib import Path
 from typing import Optional
+
+
+COMMENTORY_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 def _load_env_file() -> None:
@@ -8,7 +12,7 @@ def _load_env_file() -> None:
     except ImportError:
         return
 
-    load_dotenv()
+    load_dotenv(COMMENTORY_ENV_FILE)
 
 
 def get_solar_api_key() -> str:

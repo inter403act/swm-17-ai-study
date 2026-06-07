@@ -1,0 +1,52 @@
+services:
+  backend:
+    image: python:3.13-slim
+    working_dir: /app
+    ports:
+      - "${SERVER_PORT:-8000}:${SERVER_PORT:-8000}"
+    volumes:
+      - ..:/app
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+      RUN_SMEE_CLIENT: "false"
+    command: >
+      sh -c "pip install --no-cache-dir
+      -r commentory/ai/requirements.txt
+      -r commentory/backend/requirements.txt
+      && uvicorn commentory.backend.main:app
+      --host \"$${SERVER_HOST:-0.0.0.0}\"
+      --port \"$${SERVER_PORT:-8000}\"
+      --no-access-log"
+
+  ui:
+    image: python:3.13-slim
+    working_dir: /app
+    ports:
+      - "${UI_PORT:-8501}:${UI_PORT:-8501}"
+    volumes:
+      - ..:/app
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+    command: >
+      sh -c "pip install --no-cache-dir -r commentory/ui/requirements.txt
+      && streamlit run commentory/ui/app.py
+      --server.address 0.0.0.0
+      --server.port \"$${UI_PORT:-8501}\"
+      --server.headless true"
+
+  smee:
+    image: node:22-slim
+    depends_on:
+      - backend
+    env_file:
+      - .env
+    environment:
+      WEBHOOK_TARGET: ${WEBHOOK_TARGET:-http://backend:8000/webhooks/github}
+    command: >
+      sh -c "npx -y smee-client
+      --url \"$${SMEE_URL}\"
+      --target \"$${WEBHOOK_TARGET}\""

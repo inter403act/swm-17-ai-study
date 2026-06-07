@@ -29,7 +29,7 @@ REPO_ROOT="$(cd "$BACKEND_DIR/.." && pwd)"
 SERVER_PID=""
 
 load_env() {
-  local env_file="$BACKEND_DIR/.env"
+  local env_file="$REPO_ROOT/.env"
   local line
   local key
   local value

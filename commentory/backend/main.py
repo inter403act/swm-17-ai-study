@@ -1,9 +1,9 @@
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
-from commentory.ai.graph import run_workflow
+from commentory.ai.graph import stream_workflow_status
 from commentory.backend.github_client import (
     create_pr_comment,
     get_file_content,
@@ -16,6 +16,7 @@ from commentory.backend.github_client import (
 app = FastAPI(title="Commentory Backend")
 
 MAX_REPOSITORY_CONTEXT_FILES = 20
+WORKFLOW_RUNS: dict[str, dict[str, Any]] = {}
 
 
 @app.get("/health")
@@ -23,9 +24,44 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/workflow-runs")
+async def get_workflow_run(repository: str, pull_number: int) -> dict[str, Any]:
+    run_id = _workflow_run_id(repository, pull_number)
+    run = WORKFLOW_RUNS.get(run_id)
+    if run is None:
+        return {
+            "run_id": run_id,
+            "repository": repository,
+            "pull_number": pull_number,
+            "status": "NOT_FOUND",
+            "events": [],
+            "nodes": {},
+            "result": None,
+            "comment_url": None,
+            "error": None,
+        }
+    return run
+
+
+@app.get("/workflow-runs/recent")
+async def get_recent_workflow_runs() -> list[dict[str, Any]]:
+    return [
+        {
+            "run_id": run["run_id"],
+            "repository": run["repository"],
+            "pull_number": run["pull_number"],
+            "status": run["status"],
+            "comment_url": run.get("comment_url"),
+            "error": run.get("error"),
+        }
+        for run in reversed(list(WORKFLOW_RUNS.values()))
+    ]
+
+
 @app.post("/webhooks/github")
 async def github_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_github_event: str | None = Header(default=None),
 ) -> dict[str, Any]:
     if x_github_event != "pull_request":
@@ -39,9 +75,65 @@ async def github_webhook(
         repo_info = payload["repository"]
         owner = repo_info["owner"]["login"]
         repo = repo_info["name"]
+        repository = repo_info["full_name"]
         pull_number = int(payload["pull_request"]["number"])
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid pull_request payload") from exc
+
+    run_id = _workflow_run_id(repository, pull_number)
+    WORKFLOW_RUNS[run_id] = {
+        "run_id": run_id,
+        "repository": repository,
+        "pull_number": pull_number,
+        "status": "QUEUED",
+        "events": [],
+        "nodes": {},
+        "result": None,
+        "comment_url": None,
+        "error": None,
+    }
+    background_tasks.add_task(
+        process_pull_request_workflow,
+        owner,
+        repo,
+        repository,
+        pull_number,
+        run_id,
+    )
+
+    return {
+        "status": "workflow_started",
+        "run_id": run_id,
+        "repository": repository,
+        "pull_number": pull_number,
+    }
+
+
+def _workflow_run_id(repository: str, pull_number: int) -> str:
+    return f"{repository}#{pull_number}"
+
+
+def process_pull_request_workflow(
+    owner: str,
+    repo: str,
+    repository: str,
+    pull_number: int,
+    run_id: str,
+) -> None:
+    import asyncio
+
+    asyncio.run(_process_pull_request_workflow(owner, repo, repository, pull_number, run_id))
+
+
+async def _process_pull_request_workflow(
+    owner: str,
+    repo: str,
+    repository: str,
+    pull_number: int,
+    run_id: str,
+) -> None:
+    run = WORKFLOW_RUNS[run_id]
+    run["status"] = "FETCHING_PR"
 
     try:
         pull_request = await get_pull_request(owner, repo, pull_number)
@@ -59,28 +151,33 @@ async def github_webhook(
             repo_tree,
             repository_file_contents,
         )
-        workflow_result = run_workflow(initial_state)
-        comment = build_comment_from_workflow_result(repo_info["full_name"], pull_number, workflow_result)
 
+        workflow_result = None
+        for event in stream_workflow_status(initial_state):
+            print(f"[workflow] {event.get('status')} {event.get('current_step')} - {event.get('message')}", flush=True)
+            run["events"].append(event)
+            run["status"] = event["status"]
+            run["nodes"] = event.get("nodes") or run["nodes"]
+            workflow_result = event.get("result") or workflow_result
+
+        if workflow_result is None:
+            raise RuntimeError("Agent workflow completed without a result.")
+
+        run["result"] = workflow_result
+        comment = build_comment_from_workflow_result(repository, pull_number, workflow_result)
         created_comment = await create_pr_comment(owner, repo, pull_number, comment)
+        run["comment_url"] = created_comment.get("html_url")
+        run["status"] = "COMMENT_CREATED"
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "GitHub API request failed",
-                "status_code": exc.response.status_code,
-                "response": exc.response.text,
-            },
-        ) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return {
-        "status": "comment_created",
-        "repository": repo_info["full_name"],
-        "pull_number": pull_number,
-        "comment_url": created_comment.get("html_url"),
-    }
+        run["status"] = "FAILED"
+        run["error"] = {
+            "message": "GitHub API request failed",
+            "status_code": exc.response.status_code,
+            "response": exc.response.text,
+        }
+    except Exception as exc:
+        run["status"] = "FAILED"
+        run["error"] = str(exc)
 
 
 async def build_repository_context(
@@ -181,6 +278,6 @@ def build_comment_from_workflow_result(
     checklist_items = (workflow_result.get("checklist_result") or {}).get("items") or []
     if checklist_items:
         parts.extend(["", "### 리뷰 체크리스트"])
-        parts.extend(f"- {item}" for item in checklist_items)
+        parts.extend(f"- [ ] {item}" for item in checklist_items)
 
     return "\n".join(parts)

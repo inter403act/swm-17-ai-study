@@ -19,6 +19,8 @@ REPO_URL_PATTERN = re.compile(
 )
 DEFAULT_TEST_REPOSITORY_URL = "https://github.com/ai-tech-practice/temp-ai-tech-backend"
 GITHUB_API_URL = os.getenv("GITHUB_API_URL", "https://api.github.com")
+DEFAULT_BACKEND_API_URL = "http://backend:8000" if os.path.exists("/.dockerenv") else "http://localhost:8000"
+BACKEND_API_URL = os.getenv("BACKEND_API_URL", DEFAULT_BACKEND_API_URL).rstrip("/")
 MAX_REPOSITORY_CONTEXT_FILES = 20
 
 
@@ -144,6 +146,27 @@ async def github_put(path: str, payload: dict[str, Any]) -> Any:
         response = await client.put(f"{GITHUB_API_URL}{path}", headers=github_headers(), json=payload)
         response.raise_for_status()
         return response.json()
+
+
+async def backend_get(path: str, **params: Any) -> Any:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(f"{BACKEND_API_URL}{path}", params=params)
+        response.raise_for_status()
+        return response.json()
+
+
+def fetch_recent_workflow_runs() -> list[dict[str, Any]]:
+    return run_async(backend_get("/workflow-runs/recent"))
+
+
+def fetch_backend_workflow_run(repository: str, pull_number: int) -> dict[str, Any]:
+    return run_async(
+        backend_get(
+            "/workflow-runs",
+            repository=repository,
+            pull_number=pull_number,
+        )
+    )
 
 
 async def get_pull_request(owner: str, repo: str, pull_number: int) -> dict[str, Any]:
@@ -494,28 +517,14 @@ def create_risk_test_pull_request(repository_ref: RepositoryRef, risk_level: Ris
 
 def run_agent_workflow_for_ui(initial_state: dict[str, Any]) -> Iterator[dict[str, Any]]:
     contracts = load_contracts()
-    workflow_result = None
 
     for event in contracts.stream_workflow_status(initial_state):
-        workflow_result = event.get("result") or workflow_result
+        result = event.get("result")
         yield {
-            "type": "status",
+            "type": "result" if result is not None else "status",
             "event": event,
-            "result": None,
+            "result": result,
         }
-
-    if workflow_result is None:
-        workflow_result = contracts.run_workflow(initial_state)
-
-    yield {
-        "type": "result",
-        "event": {
-            "status": "COMPLETED",
-            "current_step": "completed",
-            "message": "Agent workflow 결과를 불러왔습니다.",
-        },
-        "result": workflow_result,
-    }
 
 
 def build_comment_body(repository: str, pull_number: int, workflow_result: dict[str, Any]) -> str:
