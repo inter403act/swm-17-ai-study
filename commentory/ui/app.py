@@ -1,7 +1,7 @@
 from html import escape
 import sys
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import streamlit as st
 
@@ -10,21 +10,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from adapters import (
-    DEFAULT_TEST_REPOSITORY_URL,
-    PullRequestRef,
-    build_comment_body,
-    create_risk_test_pull_request,
-    fetch_open_pull_requests,
-    fetch_workflow_input,
-    parse_pr_url,
-    parse_repository_url,
-    post_comment,
-    run_agent_workflow_for_ui,
+    fetch_backend_workflow_run,
+    fetch_recent_workflow_runs,
 )
 
-
-WorkflowRunner = Callable[[dict[str, Any]], Iterator[dict[str, Any]]]
-CommentBuilder = Callable[[str, int, dict[str, Any]], str]
 
 GRAPH_NODES = [
     "pending",
@@ -154,12 +143,6 @@ st.markdown(
         font-weight: 650;
         text-align: center;
       }
-      .workflow-history {
-        font-size: 0.9rem;
-        color: #555;
-        padding: 0.3rem 0;
-        border-bottom: 1px solid #f1f1f1;
-      }
       .risk-badge {
         display: inline-block;
         padding: 0.18rem 0.5rem;
@@ -184,9 +167,9 @@ def init_session() -> None:
         "pull_requests": [],
         "workflow_input": None,
         "workflow_result": None,
-        "comment_body": "",
         "events": [],
         "is_running": False,
+        "latest_backend_run_id": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -222,7 +205,7 @@ def workflow_progress(events: list[dict[str, Any]]) -> float:
 
 def render_workflow_graph(events: list[dict[str, Any]]) -> None:
     if not events:
-        st.info("workflow 실행 전입니다.")
+        st.info("Waiting for a workflow run.")
         st.progress(0.0)
         states = workflow_node_states(events)
         render_graph_blocks(states, {})
@@ -246,27 +229,27 @@ def render_graph_blocks(states: dict[str, str], messages: dict[str, str]) -> Non
         <div class="workflow-graph">
           <div class="graph-row">
             {workflow_node_html("pending", states["pending"], messages.get("pending", ""))}
-            <div class="graph-edge">→</div>
+            <div class="graph-edge">-&gt;</div>
             {workflow_node_html("pr_analysis", states["pr_analysis"], messages.get("pr_analysis", ""))}
           </div>
-          <div class="graph-edge-down">↓<div class="graph-edge-label">fan out</div></div>
+          <div class="graph-edge-down">v<div class="graph-edge-label">fan out</div></div>
           <div class="graph-branch-row">
             <div class="graph-column">
               {workflow_node_html("summary", states["summary"], messages.get("summary", ""))}
             </div>
             <div class="graph-column">
               {workflow_node_html("risk", states["risk"], messages.get("risk", ""))}
-              <div class="graph-edge-down">↓<div class="graph-edge-label">risk route</div></div>
+              <div class="graph-edge-down">v<div class="graph-edge-label">risk route</div></div>
               <div class="graph-branch-row">
                 {workflow_node_html("checklist", states["checklist"], messages.get("checklist", ""))}
                 {workflow_node_html("skip_checklist", states["skip_checklist"], messages.get("skip_checklist", ""))}
               </div>
             </div>
           </div>
-          <div class="graph-edge-down">↓<div class="graph-edge-label">join</div></div>
+          <div class="graph-edge-down">v<div class="graph-edge-label">join</div></div>
           <div class="graph-row">
             {workflow_node_html("join", states["join"], messages.get("join", ""))}
-            <div class="graph-edge">→</div>
+            <div class="graph-edge">-&gt;</div>
             {workflow_node_html("completed", states["completed"], messages.get("completed", ""))}
           </div>
         </div>
@@ -294,21 +277,6 @@ def workflow_node_html(step: str, state: str, message: str) -> str:
     )
 
 
-def render_event_history(events: list[dict[str, Any]]) -> None:
-    if not events:
-        return
-
-    with st.expander("Event History", expanded=False):
-        for event in events:
-            status = escape(str(event.get("status", "UNKNOWN")))
-            step = escape(str(event.get("current_step") or "-"))
-            message = escape(str(event.get("message") or ""))
-            st.markdown(
-                f'<div class="workflow-history"><code>{status}</code> · <code>{step}</code> · {message}</div>',
-                unsafe_allow_html=True,
-            )
-
-
 def render_workflow_result(result: dict[str, Any]) -> None:
     summary_markdown = (result.get("summary_result") or {}).get("markdown") or ""
     risk_result = result.get("risk_result") or {}
@@ -316,7 +284,7 @@ def render_workflow_result(result: dict[str, Any]) -> None:
 
     summary_tab, risk_tab, checklist_tab, raw_tab = st.tabs(["Summary", "Risk", "Checklist", "Raw"])
     with summary_tab:
-        st.markdown(summary_markdown or "_요약 결과가 없습니다._")
+        st.markdown(summary_markdown or "_No summary result yet._")
     with risk_tab:
         risk_level = str(risk_result.get("risk_level") or "UNKNOWN")
         badge_class = risk_level.lower()
@@ -330,318 +298,59 @@ def render_workflow_result(result: dict[str, Any]) -> None:
             for reason in risk_reasons:
                 st.write(f"- {reason}")
         else:
-            st.write("위험도 사유가 없습니다.")
+            st.write("No risk reasons available.")
     with checklist_tab:
         if checklist_items:
             for index, item in enumerate(checklist_items):
                 st.checkbox(item, value=False, key=f"checklist-{index}-{item}")
         else:
-            st.write("체크리스트가 생성되지 않았습니다.")
+            st.write("No checklist was generated.")
     with raw_tab:
         st.json(result)
 
 
-def render_context_summary(workflow_input: dict[str, Any]) -> None:
-    repo_tree = workflow_input.get("repo_tree") or []
-    repository_file_contents = workflow_input.get("repository_file_contents") or []
-    initial_pr_data = (workflow_input.get("initial_state") or {}).get("pr_data") or {}
-
-    with st.expander("Repository Context", expanded=False):
-        metric_cols = st.columns(3)
-        metric_cols[0].metric("Repo tree files", len(repo_tree))
-        metric_cols[1].metric("Context files", len(repository_file_contents))
-        metric_cols[2].metric("Workflow tree files", len(initial_pr_data.get("repo_tree") or []))
-
-        if repository_file_contents:
-            st.write("Loaded context")
-            for file_data in repository_file_contents:
-                path = file_data.get("path", "-")
-                content = file_data.get("content") or ""
-                st.write(f"`{path}` · {len(content):,} chars")
-        else:
-            st.write("관련 repository file content가 없습니다.")
-
-
-def render_pr_overview(pr_ref: PullRequestRef, workflow_input: dict[str, Any]) -> None:
-    pull_request = workflow_input["pull_request"]
-    changed_files = workflow_input["changed_files"]
-    repo_tree = workflow_input.get("repo_tree") or []
-    repository_file_contents = workflow_input.get("repository_file_contents") or []
-    metric_cols = st.columns(6)
-    metric_cols[0].metric("Repository", pr_ref.repository)
-    metric_cols[1].metric("PR", f"#{pr_ref.pull_number}")
-    metric_cols[2].metric("Changed files", len(changed_files))
-    metric_cols[3].metric("State", pull_request.get("state", "-"))
-    metric_cols[4].metric("Repo tree", len(repo_tree))
-    metric_cols[5].metric("Context files", len(repository_file_contents))
-
-    st.subheader(pull_request.get("title") or "Untitled PR")
-    with st.expander("Changed Files", expanded=False):
-        for changed_file in changed_files:
-            additions = changed_file.get("additions", 0)
-            deletions = changed_file.get("deletions", 0)
-            status = changed_file.get("status", "-")
-            filename = changed_file.get("filename", "-")
-            st.write(f"`{status}` `{filename}` · +{additions} / -{deletions}")
-    render_context_summary(workflow_input)
-
-
-def render_open_pull_requests(pull_requests: list[dict[str, Any]]) -> None:
-    if not pull_requests:
+def sync_latest_backend_workflow_run() -> None:
+    try:
+        recent_runs = fetch_recent_workflow_runs()
+    except Exception:
+        return
+    if not recent_runs:
         return
 
-    with st.expander("Open Pull Requests", expanded=False):
-        st.dataframe(
-            [
-                {
-                    "PR": f"#{pull_request.get('number')}",
-                    "Title": pull_request.get("title"),
-                    "Author": pull_request.get("user"),
-                    "Head": pull_request.get("head"),
-                    "Base": pull_request.get("base"),
-                    "URL": pull_request.get("html_url"),
-                }
-                for pull_request in pull_requests
-            ],
-            hide_index=True,
-            width="stretch",
-        )
-
-
-def reset_workflow_state() -> None:
-    st.session_state.workflow_result = None
-    st.session_state.comment_body = ""
-    st.session_state.events = []
-
-
-def reset_repository_state() -> None:
-    st.session_state.repository_ref = None
-    st.session_state.pull_requests = []
-    st.session_state.pr_ref = None
-    st.session_state.workflow_input = None
-    reset_workflow_state()
-
-
-def run_workflow(runner: WorkflowRunner, comment_builder: CommentBuilder) -> None:
-    workflow_input = st.session_state.workflow_input
-    pr_ref = st.session_state.pr_ref
-    if workflow_input is None or pr_ref is None:
-        st.error("workflow input이 준비되지 않았습니다.")
+    latest_run = recent_runs[0]
+    repository = latest_run.get("repository")
+    pull_number = latest_run.get("pull_number")
+    if not repository or pull_number is None:
         return
-
-    reset_workflow_state()
-    st.session_state.is_running = True
-    initial_state = workflow_input["initial_state"]
-    status_area = st.empty()
 
     try:
-        for update in runner(initial_state):
-            event = update["event"]
-            st.session_state.events.append(event)
-            with status_area.container():
-                render_workflow_graph(st.session_state.events)
-
-            if update["type"] == "result":
-                result = update["result"]
-                st.session_state.workflow_result = result
-                st.session_state.comment_body = comment_builder(
-                    pr_ref.repository,
-                    pr_ref.pull_number,
-                    result,
-                )
-    except Exception as exc:
-        failed_event = {
-            "status": "FAILED",
-            "current_step": "failed",
-            "message": str(exc),
-            "nodes": {
-                **workflow_node_states(st.session_state.events),
-                "completed": "failed",
-            },
-        }
-        st.session_state.events.append(failed_event)
-        st.error(str(exc))
-    finally:
-        st.session_state.is_running = False
-        status_area.empty()
-
-
-def create_test_pr_and_run(repository_url: str, risk_level: str) -> None:
-    try:
-        repository_ref = parse_repository_url(repository_url)
-        pr_ref = create_risk_test_pull_request(repository_ref, risk_level)
-        workflow_input = fetch_workflow_input(pr_ref)
-    except Exception as exc:
-        st.error(str(exc))
+        run = fetch_backend_workflow_run(repository, int(pull_number))
+    except Exception:
+        return
+    if run.get("status") == "NOT_FOUND":
         return
 
-    st.session_state.repository_ref = repository_ref
-    st.session_state.pr_ref = pr_ref
-    st.session_state.workflow_input = workflow_input
-    reset_workflow_state()
-    run_workflow(run_agent_workflow_for_ui, build_comment_body)
+    st.session_state.latest_backend_run_id = run.get("run_id")
+    st.session_state.events = run.get("events") or []
+    st.session_state.workflow_result = run.get("result")
+
+
+@st.fragment(run_every="1s")
+def render_live_workflow_sections() -> None:
+    sync_latest_backend_workflow_run()
+
+    st.subheader("Workflow")
+    render_workflow_graph(st.session_state.events)
+
+    st.subheader("Result")
+    if st.session_state.workflow_result:
+        render_workflow_result(st.session_state.workflow_result)
+    else:
+        st.write("workflow result is not available yet.")
 
 
 init_session()
 
 st.title("Commentory Workflow Console")
 
-with st.sidebar:
-    st.header("PR")
-    repository_url = st.text_input(
-        "GitHub Repository URL",
-        value=DEFAULT_TEST_REPOSITORY_URL,
-        placeholder="https://github.com/owner/repo",
-    )
-    st.caption("Create a real fixture PR and immediately run the workflow.")
-    risk_cols = st.columns(3)
-    high_clicked = risk_cols[0].button("HIGH", width="stretch", disabled=st.session_state.is_running)
-    medium_clicked = risk_cols[1].button("MEDIUM", width="stretch", disabled=st.session_state.is_running)
-    low_clicked = risk_cols[2].button("LOW", width="stretch", disabled=st.session_state.is_running)
-
-    st.divider()
-    load_prs_clicked = st.button(
-        "Load Open PRs",
-        width="stretch",
-        disabled=st.session_state.is_running,
-    )
-    pull_requests = st.session_state.pull_requests
-    selected_pr_number = None
-    if pull_requests:
-        selected_label = st.selectbox(
-            "Open PR",
-            [
-                f"#{pull_request['number']} · {pull_request['title']}"
-                for pull_request in pull_requests
-            ],
-        )
-        selected_pr_number = int(selected_label.split(" · ", 1)[0].removeprefix("#"))
-    fetch_selected_clicked = st.button(
-        "Fetch Selected PR",
-        width="stretch",
-        disabled=selected_pr_number is None or st.session_state.is_running,
-    )
-    st.divider()
-    pr_url = st.text_input(
-        "GitHub PR URL",
-        placeholder="https://github.com/owner/repo/pull/1",
-    )
-    fetch_clicked = st.button(
-        "Fetch PR URL",
-        width="stretch",
-        disabled=st.session_state.is_running,
-    )
-    run_disabled = st.session_state.workflow_input is None or st.session_state.is_running
-    post_disabled = (
-        not st.session_state.comment_body
-        or st.session_state.pr_ref is None
-        or st.session_state.is_running
-    )
-
-    run_clicked = st.button(
-        "Run Workflow",
-        disabled=run_disabled,
-        width="stretch",
-    )
-    post_clicked = st.button(
-        "Post Comment",
-        disabled=post_disabled,
-        width="stretch",
-    )
-
-if high_clicked:
-    create_test_pr_and_run(repository_url, "HIGH")
-
-if medium_clicked:
-    create_test_pr_and_run(repository_url, "MEDIUM")
-
-if low_clicked:
-    create_test_pr_and_run(repository_url, "LOW")
-
-if fetch_clicked:
-    try:
-        pr_ref = parse_pr_url(pr_url)
-        workflow_input = fetch_workflow_input(pr_ref)
-    except Exception as exc:
-        st.error(str(exc))
-    else:
-        st.session_state.pr_ref = pr_ref
-        st.session_state.workflow_input = workflow_input
-        reset_workflow_state()
-        st.rerun()
-
-if load_prs_clicked:
-    try:
-        repository_ref = parse_repository_url(repository_url)
-        pull_requests = fetch_open_pull_requests(repository_ref)
-    except Exception as exc:
-        st.error(str(exc))
-    else:
-        st.session_state.repository_ref = repository_ref
-        st.session_state.pull_requests = pull_requests
-        st.session_state.pr_ref = None
-        st.session_state.workflow_input = None
-        reset_workflow_state()
-        if pull_requests:
-            st.rerun()
-        else:
-            st.info(f"{repository_ref.repository}에 open PR이 없습니다.")
-
-if fetch_selected_clicked:
-    repository_ref = st.session_state.repository_ref
-    if repository_ref is None:
-        st.error("먼저 Open PR 목록을 불러와야 합니다.")
-    else:
-        try:
-            pr_ref = PullRequestRef(
-                owner=repository_ref.owner,
-                repo=repository_ref.repo,
-                pull_number=selected_pr_number,
-            )
-            workflow_input = fetch_workflow_input(pr_ref)
-        except Exception as exc:
-            st.error(str(exc))
-        else:
-            st.session_state.pr_ref = pr_ref
-            st.session_state.workflow_input = workflow_input
-            reset_workflow_state()
-            st.rerun()
-
-if run_clicked:
-    run_workflow(run_agent_workflow_for_ui, build_comment_body)
-
-if post_clicked:
-    try:
-        created_comment = post_comment(st.session_state.pr_ref, st.session_state.comment_body)
-    except Exception as exc:
-        st.error(str(exc))
-    else:
-        st.success(created_comment.get("html_url", "Comment posted."))
-
-pr_ref = st.session_state.pr_ref
-workflow_input = st.session_state.workflow_input
-
-if workflow_input and pr_ref:
-    render_pr_overview(pr_ref, workflow_input)
-elif st.session_state.pull_requests:
-    render_open_pull_requests(st.session_state.pull_requests)
-
-st.subheader("Workflow")
-render_workflow_graph(st.session_state.events)
-render_event_history(st.session_state.events)
-
-result_col, comment_col = st.columns([0.52, 0.48], gap="large")
-
-with result_col:
-    st.subheader("Result")
-    if st.session_state.workflow_result:
-        render_workflow_result(st.session_state.workflow_result)
-    else:
-        st.write("workflow 결과가 없습니다.")
-
-with comment_col:
-    st.subheader("Comment Preview")
-    if st.session_state.comment_body:
-        st.markdown(st.session_state.comment_body)
-    else:
-        st.write("생성된 comment body가 없습니다.")
+render_live_workflow_sections()

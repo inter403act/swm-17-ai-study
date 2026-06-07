@@ -46,6 +46,25 @@ CONFIG_FILES = {
     "pyproject.toml",
     "requirements.txt",
 }
+EXCLUDED_CONTEXT_PATH_PREFIXES = (
+    "commentory/backend/script/",
+    "commentory/ai/tests/",
+    "commentory/ui/",
+    ".github/",
+)
+LOW_PRIORITY_CONTEXT_PATH_PREFIXES = (
+    "commentory/",
+    "docs/",
+)
+HIGH_PRIORITY_CONTEXT_PATH_PREFIXES = (
+    "sample/src/main/",
+    "src/main/",
+    "app/",
+    "domain/",
+    "service/",
+    "controller/",
+    "repository/",
+)
 DOMAIN_KEYWORDS = {
     "authentication": ("auth", "jwt", "token", "login", "session", "permission"),
     "authorization": ("role", "acl", "permission", "authorize", "admin"),
@@ -303,7 +322,35 @@ def _limit_changed_files(changed_files: list[dict[str, Any]]) -> list[dict[str, 
 
 
 def _limit_repository_file_contents(repository_file_contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return repository_file_contents[:MAX_REPOSITORY_FILES]
+    return [
+        file_data
+        for file_data in repository_file_contents
+        if not _is_excluded_context_path(str(file_data.get("path") or file_data.get("filename") or ""))
+    ][:MAX_REPOSITORY_FILES]
+
+
+def _is_excluded_context_path(path: str) -> bool:
+    normalized_path = path.replace("\\", "/").lower()
+    return any(
+        normalized_path.startswith(prefix.lower())
+        for prefix in EXCLUDED_CONTEXT_PATH_PREFIXES
+    )
+
+
+def _context_path_priority(path: str) -> int:
+    normalized_path = path.replace("\\", "/").lower()
+    if any(normalized_path.startswith(prefix.lower()) for prefix in HIGH_PRIORITY_CONTEXT_PATH_PREFIXES):
+        return 0
+    if any(normalized_path.startswith(prefix.lower()) for prefix in LOW_PRIORITY_CONTEXT_PATH_PREFIXES):
+        return 2
+    return 1
+
+
+def _sort_context_items(items: list[dict[str, Any]], key: str = "file") -> list[dict[str, Any]]:
+    return sorted(
+        items,
+        key=lambda item: (_context_path_priority(str(item.get(key) or "")), str(item.get(key) or "")),
+    )
 
 
 def _analyze_changed_file(file_data: dict[str, Any]) -> dict[str, Any]:
@@ -458,6 +505,8 @@ def _find_related_files(
     for path in repo_tree:
         if path in changed_paths:
             continue
+        if _is_excluded_context_path(path):
+            continue
 
         lowered_path = path.lower()
         matched_terms = [term for term in search_terms if term and term in lowered_path]
@@ -468,7 +517,7 @@ def _find_related_files(
                 "retrieval_source": "path_rule",
             })
 
-    return related_files[:10]
+    return _sort_context_items(related_files)[:10]
 
 
 def _extract_imports(changed_files: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -500,6 +549,8 @@ def _find_import_related_files(
             continue
 
         for path in repo_tree:
+            if _is_excluded_context_path(path):
+                continue
             lowered_path = path.lower()
             lowered_import = import_path.lower()
             if lowered_import in lowered_path or Path(path).stem.lower() in lowered_import:
@@ -510,7 +561,7 @@ def _find_import_related_files(
                     "matched_terms": [import_data["import"]],
                 })
 
-    return _dedupe_dicts(related_files, "file")[:10]
+    return _sort_context_items(_dedupe_dicts(related_files, "file"))[:10]
 
 
 def _get_repository_file_contents(pr_data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -527,6 +578,7 @@ def _exclude_changed_files(
         file_data
         for file_data in repository_file_contents
         if (file_data.get("path") or file_data.get("filename")) not in changed_paths
+        and not _is_excluded_context_path(str(file_data.get("path") or file_data.get("filename") or ""))
     ]
 
 
@@ -545,7 +597,7 @@ def _search_related_contents(
     scores = bm25.get_scores(query_tokens)
     scored_documents = sorted(
         zip(documents, scores),
-        key=lambda item: item[1],
+        key=lambda item: (item[1], -_context_path_priority(item[0]["path"])),
         reverse=True,
     )
     results = []
@@ -621,6 +673,8 @@ def _find_direct_callers(
         path = file_data.get("path") or file_data.get("filename")
         content = file_data.get("content") or ""
         if not path or not content:
+            continue
+        if _is_excluded_context_path(str(path)):
             continue
 
         lines = content.splitlines()
@@ -957,7 +1011,7 @@ def _merge_related_files(
             "end_line": result["end_line"],
         }
 
-    return list(merged.values())[:10]
+    return _sort_context_items(list(merged.values()))[:10]
 
 
 def _merge_retrieval_sources(existing_source: str | None, new_source: str) -> str:
