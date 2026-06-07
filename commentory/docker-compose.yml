@@ -1,0 +1,38 @@
+services:
+  backend:
+    image: python:3.13-slim
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ..:/app
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+      RUN_SMEE_CLIENT: "false"
+    command: >
+      sh -c "pip install --no-cache-dir
+      -r commentory/ai/requirements.txt
+      -r commentory/backend/requirements.txt
+      && uvicorn commentory.backend.main:app --host 0.0.0.0 --port 8000"
+
+  ui:
+    image: python:3.13-slim
+    working_dir: /app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ..:/app
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+    command: >
+      sh -c "pip install --no-cache-dir -r commentory/ui/requirements.txt
+      && streamlit run commentory/ui/app.py
+      --server.address 0.0.0.0
+      --server.port 8501
+      --server.headless true"

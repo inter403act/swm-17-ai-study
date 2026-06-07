@@ -1,13 +1,15 @@
 import os
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
 except ModuleNotFoundError:
-    def load_dotenv() -> None:
+    def load_dotenv(*args, **kwargs) -> None:
         return None
 
 
-load_dotenv()
+COMMENTORY_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(COMMENTORY_ENV_FILE)
 
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
