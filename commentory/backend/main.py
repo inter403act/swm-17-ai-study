@@ -154,6 +154,7 @@ async def _process_pull_request_workflow(
 
         workflow_result = None
         for event in stream_workflow_status(initial_state):
+            print(f"[workflow] {event.get('status')} {event.get('current_step')} - {event.get('message')}", flush=True)
             run["events"].append(event)
             run["status"] = event["status"]
             run["nodes"] = event.get("nodes") or run["nodes"]
