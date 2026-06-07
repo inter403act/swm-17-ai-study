@@ -25,6 +25,39 @@ STEP_MESSAGES = {
     "join": "워크플로우 결과를 정리 중입니다.",
 }
 
+WORKFLOW_NODES = [
+    "pending",
+    "pr_analysis",
+    "summary",
+    "risk",
+    "checklist",
+    "skip_checklist",
+    "join",
+    "completed",
+]
+
+
+def _initial_node_statuses() -> dict[str, str]:
+    return {node: "waiting" for node in WORKFLOW_NODES}
+
+
+def _status_event(
+    status: str,
+    current_step: str | None,
+    message: str,
+    node_statuses: dict[str, str],
+    result: PRState | None = None,
+) -> dict[str, Any]:
+    event = {
+        "status": status,
+        "current_step": current_step,
+        "message": message,
+        "nodes": dict(node_statuses),
+    }
+    if result is not None:
+        event["result"] = result
+    return event
+
 
 def route_after_risk(state: PRState) -> str:
     risk_level = (state.get("risk_result") or {}).get("risk_level")
@@ -81,34 +114,60 @@ app = build_commentory_graph()
 
 
 def run_workflow(initial_state: PRState) -> PRState:
-    return app.invoke(initial_state)
+    workflow_result = None
+    for event in stream_workflow_status(initial_state):
+        workflow_result = event.get("result") or workflow_result
+
+    if workflow_result is None:
+        raise RuntimeError("Agent workflow completed without a result.")
+    return workflow_result
 
 
 def stream_workflow_status(initial_state: PRState) -> Iterator[dict[str, Any]]:
-    yield {
-        "status": "PENDING",
-        "current_step": None,
-        "message": "Agent workflow 실행을 준비 중입니다.",
-    }
+    node_statuses = _initial_node_statuses()
+    node_statuses["pending"] = "running"
+    workflow_result: PRState = dict(initial_state)
+
+    yield _status_event(
+        "PENDING",
+        None,
+        "Agent workflow 실행을 준비 중입니다.",
+        node_statuses,
+    )
 
     try:
         for event in app.stream(initial_state, stream_mode="updates"):
+            node_statuses["pending"] = "done"
             for node_name in event.keys():
-                yield {
-                    "status": "RUNNING",
-                    "current_step": node_name,
-                    "message": STEP_MESSAGES.get(node_name, f"{node_name} 실행 중입니다."),
-                }
+                node_update = event.get(node_name)
+                if isinstance(node_update, dict):
+                    workflow_result.update(node_update)
 
-        yield {
-            "status": "COMPLETED",
-            "current_step": "completed",
-            "message": "Agent workflow가 완료되었습니다.",
-        }
+                if node_name in node_statuses:
+                    node_statuses[node_name] = "done"
+                if node_name == "checklist":
+                    node_statuses["skip_checklist"] = "skipped"
+                if node_name == "skip_checklist":
+                    node_statuses["checklist"] = "skipped"
+
+                yield _status_event(
+                    "RUNNING",
+                    node_name,
+                    STEP_MESSAGES.get(node_name, f"{node_name} 실행 중입니다."),
+                    node_statuses,
+                )
+
+        node_statuses["pending"] = "done"
+        node_statuses["completed"] = "done"
+        yield _status_event(
+            status="COMPLETED",
+            current_step="completed",
+            message="Agent workflow가 완료되었습니다.",
+            node_statuses=node_statuses,
+            result=workflow_result,
+        )
     except Exception as error:
-        yield {
-            "status": "FAILED",
-            "current_step": "failed",
-            "message": str(error),
-        }
+        node_statuses["pending"] = "done"
+        node_statuses["completed"] = "failed"
+        yield _status_event("FAILED", "failed", str(error), node_statuses)
         raise
