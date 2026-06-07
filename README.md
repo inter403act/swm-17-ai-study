@@ -1,8 +1,37 @@
-# swm-17-ai-study
+# swm-17-ai-study — Commentory
 
-GitHub PR webhook을 받아 AI가 PR을 분석하고 리뷰 댓글을 작성하는 데모.
+GitHub Pull Request가 열리면 webhook으로 이를 받아, AI agent가 변경 내용을 분석해 **요약 · 위험도 평가 · 리뷰 체크리스트**를 생성하고 PR에 리뷰 댓글로 남기는 데모.
+
+단순히 diff만 보는 게 아니라, repository 컨텍스트(연관 파일·import·호출부)를 BM25 검색과 tree-sitter AST 분석으로 모아 LLM에 함께 제공해 리뷰 품질을 높인다.
+
+```
+PR open → webhook(smee) → backend → repo 컨텍스트 수집 → AI 워크플로우(LangGraph) → PR 댓글
+                                                                 └ UI(Streamlit)가 진행 상황 실시간 표시
+```
 
 [샘플 코드 설명](sample/README.md)
+
+## 기술 스택
+
+| 영역 | 사용 기술 |
+| --- | --- |
+| 언어 | Python 3.13 |
+| Backend | FastAPI, Uvicorn, httpx |
+| AI 워크플로우 | LangGraph, LangChain |
+| LLM | Solar (Upstage, `solar-pro2`) — `langchain-upstage` |
+| 코드 분석 | tree-sitter (+ tree-sitter-java) AST, rank-bm25 검색 |
+| UI | Streamlit |
+| 연동 | GitHub Webhooks, smee.io (로컬 중계) |
+| 인프라 | Docker Compose |
+
+## 구성
+
+| 디렉터리 | 역할 |
+| --- | --- |
+| `commentory/backend/` | FastAPI. webhook 수신, 컨텍스트 수집, 워크플로우 실행, PR 댓글 작성 |
+| `commentory/ai/` | LangGraph 기반 AI agent — 요약 / 위험도 / 체크리스트 노드와 PR 분석 |
+| `commentory/ui/` | Streamlit. backend를 polling 해 워크플로우 진행과 결과 표시 |
+| `sample/` | 분석 대상 예시 코드 (Java) |
 
 ## 실행
 
