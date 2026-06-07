@@ -135,11 +135,18 @@ wait_for_url() {
 ensure_webhook() {
   local hook_id
 
-  hook_id="$(
+  # /hooks 조회·생성은 레포 admin 권한이 필요하다. write 권한만 있는 collaborator는
+  # 여기서 403/404를 받으므로, 권한이 없으면 webhook이 이미 설정돼 있다고 가정하고
+  # 건너뛴다. webhook은 소유자가 1회만 만들면 되고, 그 뒤로는 write 권한으로 데모를
+  # 끝까지 돌릴 수 있다.
+  if ! hook_id="$(
     gh api "repos/$TARGET_REPO/hooks" \
       --jq ".[] | select(.config.url == \"$SMEE_URL\") | select(.events | index(\"pull_request\")) | .id" \
-      | head -n 1
-  )"
+      2>/dev/null | head -n 1
+  )"; then
+    echo "webhook 조회 권한이 없어 확인을 건너뜁니다 (이미 설정돼 있다고 가정)."
+    return
+  fi
 
   if [[ -n "$hook_id" ]]; then
     echo "Webhook이 이미 존재합니다: $hook_id"
